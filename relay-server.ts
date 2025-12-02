@@ -246,17 +246,73 @@ class KRIMassRelayServer {
         }
       });
 
-      // ✅ СПРИНТ 3: Group synchronization
+      // ✅ ULTRA SPRINT 1: WebRTC Video Calls - SDP/ICE Relay
+      /** @watermark KRIPROT-WEBRTC-SIGNALING-c9d2e4f3 */
+      socket.on('webrtc:offer', (data: { to: string; offer: any }) => {
+        const recipient = this.users.get(data.to);
+        if (recipient) {
+          const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+          this.io.to(recipient.socketId).emit('webrtc:offer', {
+            from: sender?.id,
+            offer: data.offer
+          });
+          console.log(`📹 WebRTC offer: ${sender?.id} → ${data.to}`);
+        }
+      });
+
+      socket.on('webrtc:answer', (data: { to: string; answer: any }) => {
+        const recipient = this.users.get(data.to);
+        if (recipient) {
+          const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+          this.io.to(recipient.socketId).emit('webrtc:answer', {
+            from: sender?.id,
+            answer: data.answer
+          });
+          console.log(`📹 WebRTC answer: ${sender?.id} → ${data.to}`);
+        }
+      });
+
+      socket.on('webrtc:ice', (data: { to: string; candidate: any }) => {
+        const recipient = this.users.get(data.to);
+        if (recipient) {
+          const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+          this.io.to(recipient.socketId).emit('webrtc:ice', {
+            from: sender?.id,
+            candidate: data.candidate
+          });
+        }
+      });
+
+      socket.on('webrtc:hangup', (data: { to: string }) => {
+        const recipient = this.users.get(data.to);
+        if (recipient) {
+          const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+          this.io.to(recipient.socketId).emit('webrtc:hangup', {
+            from: sender?.id
+          });
+          console.log(`📵 WebRTC hangup: ${sender?.id} → ${data.to}`);
+        }
+      });
+
+      // ✅ ULTRA SPRINT 2: Group Chat - Enhanced sync
+      /** @watermark KRIPROT-GROUP-SYNC-d3e5f6a4 */
       socket.on('group:create', (data: {
         groupId: string;
         name: string;
         description: string;
         publicKey: string;
         createdBy: string;
+        members: string[];
         timestamp: number;
       }) => {
-        console.log(`📡 Group created: ${data.name}`);
-        socket.broadcast.emit('group:created', data);
+        console.log(`� Group created: ${data.name} by ${data.createdBy}`);
+        // Broadcast to all members
+        data.members.forEach(memberId => {
+          const member = this.users.get(memberId);
+          if (member) {
+            this.io.to(member.socketId).emit('group:created', data);
+          }
+        });
       });
 
       socket.on('group:add_member', (data: {
@@ -267,14 +323,89 @@ class KRIMassRelayServer {
         const member = this.users.get(data.userId);
         if (member) {
           this.io.to(member.socketId).emit('group:invitation', data);
+          console.log(`👤 Added to group: ${data.userId} → ${data.groupId}`);
         }
       });
 
       socket.on('group:message', (data: {
         groupId: string;
-        message: any;
+        from: string;
+        cipher: string;
+        harmony: number;
+        timestamp: number;
       }) => {
+        // Broadcast to all users (they filter by groupId locally)
         socket.broadcast.emit('group:message_received', data);
+        console.log(`💬 Group message: ${data.from} → ${data.groupId} (S=${data.harmony})`);
+      });
+
+      socket.on('group:leave', (data: { groupId: string; userId: string }) => {
+        socket.broadcast.emit('group:member_left', data);
+        console.log(`👋 Left group: ${data.userId} from ${data.groupId}`);
+      });
+
+      // ✅ ULTRA SPRINT 3: File Sharing - Binary relay
+      /** @watermark KRIPROT-FILE-TRANSFER-e4f6a7b5 */
+      socket.on('file:send', (data: {
+        to: string;
+        from: string;
+        fileName: string;
+        fileSize: number;
+        fileType: string;
+        chunk: string; // Base64 chunk
+        chunkIndex: number;
+        totalChunks: number;
+        fileId: string;
+      }) => {
+        const recipient = this.users.get(data.to);
+        if (recipient) {
+          this.io.to(recipient.socketId).emit('file:receive', data);
+          console.log(`📎 File chunk ${data.chunkIndex}/${data.totalChunks}: ${data.fileName}`);
+        }
+      });
+
+      socket.on('file:complete', (data: { to: string; fileId: string }) => {
+        const recipient = this.users.get(data.to);
+        if (recipient) {
+          this.io.to(recipient.socketId).emit('file:transfer_complete', data);
+          console.log(`✅ File transfer complete: ${data.fileId}`);
+        }
+      });
+
+      // ✅ ULTRA SPRINT 4: Voice Messages - Audio relay
+      /** @watermark KRIPROT-VOICE-RELAY-f5a7b8c6 */
+      socket.on('voice:send', (data: {
+        to: string;
+        from: string;
+        audioBlob: string; // Base64 audio
+        duration: number;
+        timestamp: number;
+      }) => {
+        const recipient = this.users.get(data.to);
+        if (recipient) {
+          this.io.to(recipient.socketId).emit('voice:receive', data);
+          console.log(`🎤 Voice message: ${data.from} → ${data.to} (${data.duration}s)`);
+        }
+      });
+
+      // ✅ ULTRA SPRINT 5: Self-Destruct - Cross-device sync
+      /** @watermark KRIPROT-SELF-DESTRUCT-a6b8c9d7 */
+      socket.on('message:self_destruct', (data: {
+        messageId: string;
+        contactId: string;
+        userId: string;
+      }) => {
+        // Notify both sender and recipient to delete
+        const contact = this.users.get(data.contactId);
+        if (contact) {
+          this.io.to(contact.socketId).emit('message:delete', {
+            messageId: data.messageId,
+            from: data.userId
+          });
+        }
+        // Confirm to sender
+        socket.emit('message:deleted', { messageId: data.messageId });
+        console.log(`💣 Self-destruct: message ${data.messageId}`);
       });
 
       // P2P обмін ключами
