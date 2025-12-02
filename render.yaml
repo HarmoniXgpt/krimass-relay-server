@@ -2,8 +2,12 @@ services:
   - type: web
     name: krimass-relay
     env: node
+    region: oregon
+    plan: free
     buildCommand: npm install && npm run build
     startCommand: node dist/relay-server.js
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: PORT
-        value: 3000
+        sync: false
