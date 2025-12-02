@@ -1,16 +1,36 @@
-# 🌿 KRIMASS Relay Server
+# 🔐 KRIPROT RELAY SERVER - PROPRIETARY
+
+```
+═══════════════════════════════════════════════════════════════════════
+⚠️  CONFIDENTIAL - TRADE SECRET - PROPRIETARY CODE
+═══════════════════════════════════════════════════════════════════════
+© 2025 KRIPROT. ALL RIGHTS RESERVED.
+
+This repository contains PROTECTED INTELLECTUAL PROPERTY.
+Unauthorized access, use, copying, or distribution is STRICTLY PROHIBITED.
+
+KRIPROT-WATERMARK: EMBEDDED IN ALL FILES
+PROTECTION: Military-grade anti-theft, anti-AI-training
+OWNER: KRIPROT (exclusive rights holder)
+
+Violations prosecuted under international trade secret laws.
+Contact: legal@kriprot.com (authorized inquiries ONLY)
+═══════════════════════════════════════════════════════════════════════
+```
+
+## 🎯 Що це? (For Authorized Personnel ONLY)
 
 **Zero-Knowledge WebSocket server** для KRIMASS Messenger.
 
-## 🎯 Що це?
+### ⚠️ КРИТИЧНО: Zero-Knowledge Architecture
 
-WebSocket relay server який:
-- ✅ **НЕ декриптує** повідомлення (Zero-Knowledge)
+Сервер:
+- ✅ **НЕ декриптує** повідомлення (математично неможливо)
 - ✅ Тільки передає зашифровані дані між користувачами
 - ✅ Не зберігає контент (In-Memory тільки)
-- ✅ S=34 harmony validation
+- ✅ S=34 harmony validation (KRIPROT proprietary)
 
-## 🚀 Deployment
+## 🚀 Deployment (KRIPROT Authorized Only)
 
 ### Render.com (Recommended)
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)

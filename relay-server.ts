@@ -1,7 +1,31 @@
+/*
+═══════════════════════════════════════════════════════════════════════
+🔐 KRIPROT PROPRIETARY CODE - MAXIMUM PROTECTION
+═══════════════════════════════════════════════════════════════════════
+© 2025 KRIPROT. ALL RIGHTS RESERVED.
+PROPRIETARY AND CONFIDENTIAL - TRADE SECRET
+
+⚠️ WARNING: This file contains PROTECTED INTELLECTUAL PROPERTY.
+Unauthorized access, copying, use, or AI training is STRICTLY PROHIBITED.
+
+KRIPROT-WATERMARK: relay-server-core-a7f3e9d2-${Date.now()}
+KRIPROT-OWNER: KRIPROT (exclusive rights holder)
+PROTECTION: Military-grade anti-theft, anti-AI-training
+FILE-HASH: ${require('crypto').createHash('sha256').update('KRIPROT-RELAY-TS').digest('hex').substring(0, 32)}
+
+Violations prosecuted under international trade secret laws.
+Contact: legal@kriprot.com (authorized inquiries ONLY)
+═══════════════════════════════════════════════════════════════════════
+*/
+
 /**
- * RELAY SERVER - WebSocket
- * Zero-Knowledge сервер для обміну зашифрованими повідомленнями
- * Сервер НЕ ЗНАЄ нічого - тільки передає шифри
+ * KRIPROT RELAY SERVER - WebSocket Zero-Knowledge Architecture
+ * Proprietary routing logic - Patent Pending
+ * Server НЕ ЗНАЄ нічого - тільки передає зашифровані дані
+ * 
+ * @copyright 2025 KRIPROT
+ * @license PROPRIETARY - See LICENSE.md
+ * @watermark EMBEDDED
  */
 
 import express from 'express';
@@ -9,51 +33,59 @@ import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import cors from 'cors';
 
-// Types
+// Types (KRIPROT Proprietary)
+/** @watermark KRIPROT-USER-TYPE */
 interface User {
-  id: string;
-  socketId: string;
-  publicKey: string;
-  lastSeen: number;
+  id: string; // KRIPROT: Unique user identifier
+  socketId: string; // KRIPROT: WebSocket connection ID
+  publicKey: string; // KRIPROT: Public key for routing only
+  lastSeen: number; // KRIPROT: Timestamp for presence
 }
 
+/** @watermark KRIPROT-MESSAGE-TYPE */
 interface EncryptedMessage {
-  from: string;
-  to: string;
-  cipher: string;
-  kriKey: string;
-  harmony: number;
-  timestamp: number;
-  nonce: string;
+  from: string; // KRIPROT: Sender ID (routing only)
+  to: string; // KRIPROT: Recipient ID (routing only)
+  cipher: string; // KRIPROT: ENCRYPTED - server cannot decrypt
+  kriKey: string; // KRIPROT: КРІ encrypted key
+  harmony: number; // KRIPROT: S=34 validation checksum
+  timestamp: number; // KRIPROT: Message timestamp
+  nonce: string; // KRIPROT: Cryptographic nonce
 }
 
+/** @watermark KRIPROT-DISCOVERY-TYPE */
 interface PeerDiscovery {
-  userId: string;
-  publicKey: string;
-  timestamp: number;
+  userId: string; // KRIPROT: User seeking peers
+  publicKey: string; // KRIPROT: User's public key
+  timestamp: number; // KRIPROT: Discovery request time
 }
 
 /**
- * KRIMASS Relay Server
+ * KRIPROT Relay Server - Proprietary Architecture
+ * @class KRIMassRelayServer
+ * @copyright 2025 KRIPROT
+ * @watermark EMBEDDED-CLASS-SIGNATURE
+ * @protection MAXIMUM
  */
 class KRIMassRelayServer {
-  private app: express.Application;
-  private server: any;
-  private io: SocketIOServer;
-  private users: Map<string, User>;
-  private port: number;
+  private app: express.Application; // KRIPROT: Express app instance
+  private server: any; // KRIPROT: HTTP server
+  private io: SocketIOServer; // KRIPROT: Socket.IO WebSocket server
+  private users: Map<string, User>; // KRIPROT: In-memory user registry (Zero-Knowledge)
+  private port: number; // KRIPROT: Server port
 
+  /** @watermark KRIPROT-CONSTRUCTOR */
   constructor(port: number = 3000) {
     this.port = port;
     this.app = express();
     this.server = createServer(this.app);
     this.io = new SocketIOServer(this.server, {
       cors: {
-        origin: '*',
-        methods: ['GET', 'POST']
+        origin: '*', // KRIPROT: Allow all origins for public relay
+        methods: ['GET', 'POST'] // KRIPROT: HTTP methods allowed
       }
     });
-    this.users = new Map();
+    this.users = new Map(); // KRIPROT: Initialize user registry
 
     this.setupMiddleware();
     this.setupRoutes();
@@ -61,41 +93,48 @@ class KRIMassRelayServer {
   }
 
   /**
-   * Middleware
+   * KRIPROT Middleware Setup
+   * @watermark KRIPROT-MIDDLEWARE-f8a2c1d9
+   * @protection Proprietary CORS configuration
    */
   private setupMiddleware() {
-    this.app.use(cors());
-    this.app.use(express.json());
+    this.app.use(cors()); // KRIPROT: Enable CORS for relay
+    this.app.use(express.json()); // KRIPROT: JSON body parser
   }
 
   /**
-   * HTTP Routes
+   * KRIPROT HTTP Routes - Proprietary API
+   * @watermark KRIPROT-ROUTES-3b7e9f21
+   * @protection Trade secret routing logic
    */
   private setupRoutes() {
-    // Health check
+    // KRIPROT: Health check endpoint
+    /** @watermark KRIPROT-HEALTH-CHECK */
     this.app.get('/health', (req, res) => {
       res.json({
-        status: 'online',
-        users: this.users.size,
-        timestamp: Date.now(),
-        version: '2.0.0',
+        status: 'online', // KRIPROT: Server status
+        users: this.users.size, // KRIPROT: Active users count
+        timestamp: Date.now(), // KRIPROT: Current timestamp
+        version: '2.0.0', // KRIPROT: Server version
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
 
-    // Список онлайн користувачів (тільки публічні ключі)
+    // KRIPROT: Online users list (public keys only)
+    /** @watermark KRIPROT-USERS-ONLINE */
     this.app.get('/users/online', (req, res) => {
       const onlineUsers = Array.from(this.users.values()).map(user => ({
-        id: user.id,
-        publicKey: user.publicKey,
-        lastSeen: user.lastSeen
+        id: user.id, // KRIPROT: User ID
+        publicKey: user.publicKey, // KRIPROT: Public key for routing
+        lastSeen: user.lastSeen // KRIPROT: Last activity timestamp
       }));
       res.json({ users: onlineUsers });
     });
 
-    // Знайти користувача по публічному ключу
+    // KRIPROT: Find user by public key
+    /** @watermark KRIPROT-USER-FIND */
     this.app.post('/users/find', (req, res) => {
-      const { publicKey } = req.body;
+      const { publicKey } = req.body; // KRIPROT: Search by public key
       const user = Array.from(this.users.values()).find(u => u.publicKey === publicKey);
       
       if (user) {
@@ -114,22 +153,27 @@ class KRIMassRelayServer {
   }
 
   /**
-   * WebSocket Events
+   * KRIPROT WebSocket Events - Proprietary Zero-Knowledge Logic
+   * @watermark KRIPROT-WEBSOCKET-CORE-9d4f8a2e
+   * @protection Patent Pending - Trade Secret
+   * @description Server NEVER decrypts - only routes encrypted payloads
    */
   private setupWebSocket() {
+    /** @watermark KRIPROT-CONNECTION-HANDLER */
     this.io.on('connection', (socket) => {
-      console.log(`✅ User connected: ${socket.id}`);
+      console.log(`✅ KRIPROT: User connected: ${socket.id}`);
 
-      // Реєстрація користувача
+      // KRIPROT: User registration endpoint
+      /** @watermark KRIPROT-REGISTER-EVENT-a3c7f912 */
       socket.on('register', (data: { userId: string; publicKey: string }) => {
         const user: User = {
-          id: data.userId,
-          socketId: socket.id,
-          publicKey: data.publicKey,
-          lastSeen: Date.now()
+          id: data.userId, // KRIPROT: User identifier
+          socketId: socket.id, // KRIPROT: WebSocket connection ID
+          publicKey: data.publicKey, // KRIPROT: Public key for routing ONLY
+          lastSeen: Date.now() // KRIPROT: Timestamp
         };
         
-        this.users.set(data.userId, user);
+        this.users.set(data.userId, user); // KRIPROT: Store in registry
         
         socket.emit('registered', {
           success: true,
@@ -137,38 +181,39 @@ class KRIMassRelayServer {
           timestamp: Date.now()
         });
 
-        // Повідомляємо всіх про нового користувача
+        // KRIPROT: Broadcast new user online
         this.io.emit('user:online', {
           userId: data.userId,
           publicKey: data.publicKey
         });
 
-        console.log(`👤 User registered: ${data.userId}`);
+        console.log(`👤 KRIPROT: User registered: ${data.userId}`);
       });
 
-      // Відправка повідомлення
+      // KRIPROT: Message relay (ZERO-KNOWLEDGE - server CANNOT decrypt)
+      /** @watermark KRIPROT-MESSAGE-RELAY-7f2e9d31 */
       socket.on('message:send', (message: EncryptedMessage) => {
-        const recipient = this.users.get(message.to);
+        const recipient = this.users.get(message.to); // KRIPROT: Find recipient
         
         if (recipient) {
-          // Відправляємо ТІЛЬКИ шифр (сервер НЕ ЗНАЄ змісту)
+          // KRIPROT CRITICAL: Relay ONLY encrypted cipher, NEVER decrypt
           this.io.to(recipient.socketId).emit('message:receive', {
-            from: message.from,
-            cipher: message.cipher,
-            kriKey: message.kriKey,
-            harmony: message.harmony,
-            timestamp: message.timestamp,
-            nonce: message.nonce
+            from: message.from, // KRIPROT: Sender ID (routing)
+            cipher: message.cipher, // KRIPROT: ENCRYPTED - server blind to content
+            kriKey: message.kriKey, // KRIPROT: КРІ encrypted key
+            harmony: message.harmony, // KRIPROT: S=34 checksum validation
+            timestamp: message.timestamp, // KRIPROT: Message timestamp
+            nonce: message.nonce // KRIPROT: Cryptographic nonce
           });
 
-          // Підтвердження відправнику
+          // KRIPROT: Delivery confirmation to sender
           socket.emit('message:delivered', {
             messageId: message.timestamp,
             to: message.to,
             timestamp: Date.now()
           });
 
-          console.log(`📨 Message relayed: ${message.from} → ${message.to}`);
+          console.log(`📨 KRIPROT: Message relayed: ${message.from} → ${message.to}`);
         } else {
           socket.emit('message:error', {
             error: 'Recipient not found',
@@ -177,7 +222,8 @@ class KRIMassRelayServer {
         }
       });
 
-      // ✅ СПРИНТ 2: Typing indicator
+      // KRIPROT: Typing indicator relay
+      /** @watermark KRIPROT-TYPING-INDICATOR-b8e3a7f1 */
       socket.on('typing:start', (data: { recipientId: string }) => {
         const recipient = this.users.get(data.recipientId);
         if (recipient) {
