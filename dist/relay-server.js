@@ -274,7 +274,8 @@ class KRIMassRelayServer {
 exports.default = KRIMassRelayServer;
 // Якщо запускається напряму
 if (require.main === module) {
-    const server = new KRIMassRelayServer(3000);
+    const PORT = process.env.PORT || 3000;
+    const server = new KRIMassRelayServer(Number(PORT));
     server.start();
 }
 //# sourceMappingURL=relay-server.js.map
