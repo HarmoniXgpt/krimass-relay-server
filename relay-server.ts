@@ -234,7 +234,7 @@ class KRIMassRelayServer {
         status: 'online', // KRIPROT: Server status
         users: this.users.size, // KRIPROT: Active users count
         timestamp: Date.now(), // KRIPROT: Current timestamp
-        version: '2.0.0', // KRIPROT: Server version
+        version: '2.0.1', // KRIPROT: Server version
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
@@ -361,8 +361,9 @@ class KRIMassRelayServer {
             harmony: message.harmony, // KRIPROT: S=34 checksum validation
             timestamp: message.timestamp, // KRIPROT: Message timestamp
             nonce: message.nonce, // KRIPROT: Cryptographic nonce
-            messageId: message.messageId, // Optional idempotency key
-            groupId: message.groupId
+            // Always include messageId (fallback to timestamp) so clients can ack reliably.
+            messageId: message.messageId || String(message.timestamp),
+            groupId: message.groupId || null
           });
 
           // KRIPROT: Delivery confirmation to sender
@@ -405,37 +406,74 @@ class KRIMassRelayServer {
         try {
           if (!data || !data.messageId || !data.to || !data.from) return;
 
-          if (!checkEventRateLimit(String(data.from), 'message:ack')) {
+          const mid = String(data.messageId);
+          const fromId = String(data.from);
+          const toId = String(data.to);
+          const debugAck = process.env.KRIMASS_DEBUG_ACK === '1';
+
+          if (!checkEventRateLimit(fromId, 'message:ack')) {
+            if (debugAck) {
+              console.log(`⏳ KRIPROT: Ack rate-limited: mid=${mid} from=${fromId} to=${toId}`);
+            }
             return;
           }
 
-          const sender = this.users.get(data.to);
+          if (debugAck) {
+            console.log(`✅ KRIPROT: Ack received: mid=${mid} from=${fromId} to=${toId}`);
+          }
+
+          const sender = this.users.get(toId);
           if (sender) {
             this.io.to(sender.socketId).emit('message:ack', {
-              messageId: String(data.messageId),
-              from: String(data.from),
-              to: String(data.to),
+              messageId: mid,
+              from: fromId,
+              to: toId,
               timestamp: Date.now()
             });
+            if (debugAck) {
+              console.log(`↩️  KRIPROT: Ack forwarded (direct): mid=${mid} toSocket=${sender.socketId}`);
+            }
             return;
           }
 
           // Fallback: route by remembered sender socketId for this messageId.
           // This fixes rare register/disconnect races in battle-mode E2E without storing plaintext.
-          const mid = String(data.messageId);
           const route = this.messageRoutes.get(mid);
-          if (!route) return;
-          if (route.senderId !== String(data.to)) return;
-          if (route.recipientId !== String(data.from)) return;
+          if (!route) {
+            if (debugAck) {
+              console.log(`⚠️  KRIPROT: Ack fallback miss: mid=${mid} (no route)`);
+            }
+            return;
+          }
+          if (route.senderId !== toId) {
+            if (debugAck) {
+              console.log(`⚠️  KRIPROT: Ack fallback reject: mid=${mid} senderId mismatch route=${route.senderId} data.to=${toId}`);
+            }
+            return;
+          }
+          if (route.recipientId !== fromId) {
+            if (debugAck) {
+              console.log(`⚠️  KRIPROT: Ack fallback reject: mid=${mid} recipientId mismatch route=${route.recipientId} data.from=${fromId}`);
+            }
+            return;
+          }
 
           const targetSocketId = route.senderSocketId;
-          if (!targetSocketId) return;
+          if (!targetSocketId) {
+            if (debugAck) {
+              console.log(`⚠️  KRIPROT: Ack fallback miss: mid=${mid} (no senderSocketId)`);
+            }
+            return;
+          }
           this.io.to(targetSocketId).emit('message:ack', {
             messageId: mid,
-            from: String(data.from),
-            to: String(data.to),
+            from: fromId,
+            to: toId,
             timestamp: Date.now()
           });
+          if (debugAck) {
+            console.log(`↩️  KRIPROT: Ack forwarded (fallback): mid=${mid} toSocket=${targetSocketId}`);
+          }
         } catch {
           // ignore
         }
