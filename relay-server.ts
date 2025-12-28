@@ -30,8 +30,64 @@ Contact: legal@kriprot.com (authorized inquiries ONLY)
 
 import express from 'express';
 import { createServer } from 'http';
+import { createServer as createHttpsServer } from 'https';
 import { Server as SocketIOServer } from 'socket.io';
 import cors from 'cors';
+import fs from 'fs';
+// ✅ 27-MIN SPRINT: WSS Configuration
+import { getServerConfig } from './ssl-config';
+
+// Privacy / metadata-minimization mode (opt-in)
+// When enabled, the relay avoids broadcasting public keys and reduces online user enumeration.
+const PRIVACY_MODE = String(process.env.KRIMASS_PRIVACY || process.env.RELAY_PRIVACY_MODE || '').trim() === '1';
+
+// ✅ ULTRA CACHE PRODUCTION: Rate Limiting для ВСІХ подій
+const RATE_LIMITS = {
+  'register': { max: 5, window: 300000 },       // 5 реєстрацій за 5 хв
+  'message:send': { max: 100, window: 60000 },  // 100 повідомлень/хв
+  'message:ack': { max: 300, window: 60000 },   // 300 ack/хв
+  'peer:discover': { max: 20, window: 60000 },  // 20 запитів/хв
+  'key:exchange': { max: 10, window: 60000 },   // 10 обмінів/хв
+  'typing:start': { max: 50, window: 60000 },   // 50 typing/хв
+  'group:create': { max: 5, window: 300000 },   // 5 груп за 5 хв
+  'file:send': { max: 20, window: 60000 }       // 20 файлів/хв
+};
+
+const eventCounts = new Map<string, Map<string, { count: number; resetTime: number }>>();
+
+function checkEventRateLimit(userId: string, event: string): boolean {
+  const limit = RATE_LIMITS[event as keyof typeof RATE_LIMITS] || { max: 100, window: 60000 };
+  const now = Date.now();
+  
+  if (!eventCounts.has(event)) {
+    eventCounts.set(event, new Map());
+  }
+  
+  const userCounts = eventCounts.get(event)!;
+  const userLimit = userCounts.get(userId);
+  
+  if (!userLimit || now > userLimit.resetTime) {
+    userCounts.set(userId, {
+      count: 1,
+      resetTime: now + limit.window
+    });
+    return true;
+  }
+  
+  if (userLimit.count >= limit.max) {
+    return false; // Rate limit exceeded
+  }
+  
+  userLimit.count++;
+  return true;
+}
+
+// ✅ LEGACY: Старий метод (для зворотної сумісності)
+const messageCounts = new Map<string, { count: number; resetTime: number }>();
+
+function checkRateLimit(userId: string): boolean {
+  return checkEventRateLimit(userId, 'message:send');
+}
 
 // Types (KRIPROT Proprietary)
 /** @watermark KRIPROT-USER-TYPE */
@@ -51,6 +107,16 @@ interface EncryptedMessage {
   harmony: number; // KRIPROT: S=34 validation checksum
   timestamp: number; // KRIPROT: Message timestamp
   nonce: string; // KRIPROT: Cryptographic nonce
+  messageId?: string; // Optional idempotency key for retries/dedup (no plaintext)
+  groupId?: string; // Optional group routing hint (still E2E encrypted per-recipient)
+}
+
+/** @watermark KRIPROT-MESSAGE-ACK-TYPE */
+interface MessageAck {
+  messageId: string;
+  from: string; // ack sender (recipient of original message)
+  to: string;   // original sender
+  timestamp: number;
 }
 
 /** @watermark KRIPROT-DISCOVERY-TYPE */
@@ -73,23 +139,76 @@ class KRIMassRelayServer {
   private io: SocketIOServer; // KRIPROT: Socket.IO WebSocket server
   private users: Map<string, User>; // KRIPROT: In-memory user registry (Zero-Knowledge)
   private port: number; // KRIPROT: Server port
+  private messageRoutes: Map<string, { senderId: string; senderSocketId: string; recipientId: string; createdAt: number }>;
 
   /** @watermark KRIPROT-CONSTRUCTOR */
-  constructor(port: number = 3000) {
-    this.port = port;
+  constructor(port?: number) {
+    // ✅ 27-MIN SPRINT: WSS Configuration based on environment
+    const config = getServerConfig();
+    this.port = port || config.port;
+    
     this.app = express();
-    this.server = createServer(this.app);
+    
+    // ✅ 27-MIN SPRINT: Create HTTPS server if SSL enabled
+    if (config.ssl && config.ssl.enabled && config.ssl.keyPath && config.ssl.certPath) {
+      try {
+        const httpsOptions = {
+          key: fs.readFileSync(config.ssl.keyPath),
+          cert: fs.readFileSync(config.ssl.certPath),
+        };
+        this.server = createHttpsServer(httpsOptions, this.app);
+        console.log('🔒 WSS (Secure WebSocket) enabled');
+      } catch (error) {
+        console.warn('⚠️ SSL cert не знайдено, використовую HTTP:', error);
+        this.server = createServer(this.app);
+      }
+    } else {
+      this.server = createServer(this.app);
+      console.log('🔌 WS (Insecure WebSocket) - development only');
+    }
+    
     this.io = new SocketIOServer(this.server, {
       cors: {
-        origin: '*', // KRIPROT: Allow all origins for public relay
-        methods: ['GET', 'POST'] // KRIPROT: HTTP methods allowed
+        origin: '*',
+        methods: ['GET', 'POST']
       }
     });
     this.users = new Map(); // KRIPROT: Initialize user registry
+    this.messageRoutes = new Map();
 
     this.setupMiddleware();
     this.setupRoutes();
     this.setupWebSocket();
+
+    // Best-effort cleanup for transient message routes (ack fallback).
+    setInterval(() => {
+      try {
+        const now = Date.now();
+        for (const [mid, route] of this.messageRoutes.entries()) {
+          if (!route || now - route.createdAt > 10 * 60 * 1000) {
+            this.messageRoutes.delete(mid);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }, 60 * 1000).unref?.();
+  }
+
+  private rememberMessageRoute(message: EncryptedMessage, senderSocketId: string) {
+    try {
+      if (!message || !message.messageId || !message.from || !message.to) return;
+      const mid = String(message.messageId);
+      if (!mid) return;
+      this.messageRoutes.set(mid, {
+        senderId: String(message.from),
+        senderSocketId: String(senderSocketId),
+        recipientId: String(message.to),
+        createdAt: Date.now(),
+      });
+    } catch {
+      // ignore
+    }
   }
 
   /**
@@ -123,17 +242,32 @@ class KRIMassRelayServer {
     // KRIPROT: Online users list (public keys only)
     /** @watermark KRIPROT-USERS-ONLINE */
     this.app.get('/users/online', (req, res) => {
+      if (PRIVACY_MODE) {
+        // Minimize metadata: avoid sharing public keys and reduce enumerability.
+        const onlineUsers = Array.from(this.users.values()).map(user => ({
+          id: user.id,
+          lastSeen: user.lastSeen
+        }));
+        res.json({ users: onlineUsers, privacyMode: true });
+        return;
+      }
+
       const onlineUsers = Array.from(this.users.values()).map(user => ({
         id: user.id, // KRIPROT: User ID
         publicKey: user.publicKey, // KRIPROT: Public key for routing
         lastSeen: user.lastSeen // KRIPROT: Last activity timestamp
       }));
-      res.json({ users: onlineUsers });
+      res.json({ users: onlineUsers, privacyMode: false });
     });
 
     // KRIPROT: Find user by public key
     /** @watermark KRIPROT-USER-FIND */
     this.app.post('/users/find', (req, res) => {
+      if (PRIVACY_MODE) {
+        res.status(403).json({ error: 'Disabled in privacy mode' });
+        return;
+      }
+
       const { publicKey } = req.body; // KRIPROT: Search by public key
       const user = Array.from(this.users.values()).find(u => u.publicKey === publicKey);
       
@@ -166,6 +300,15 @@ class KRIMassRelayServer {
       // KRIPROT: User registration endpoint
       /** @watermark KRIPROT-REGISTER-EVENT-a3c7f912 */
       socket.on('register', (data: { userId: string; publicKey: string }) => {
+        // ✅ ULTRA CACHE: Rate limit для register
+        if (!checkEventRateLimit(data.userId, 'register')) {
+          socket.emit('register:error', {
+            code: 'RATE_LIMIT_EXCEEDED',
+            error: 'Занадто багато спроб реєстрації. Зачекайте 5 хвилин.'
+          });
+          return;
+        }
+        
         const user: User = {
           id: data.userId, // KRIPROT: User identifier
           socketId: socket.id, // KRIPROT: WebSocket connection ID
@@ -182,7 +325,9 @@ class KRIMassRelayServer {
         });
 
         // KRIPROT: Broadcast new user online
-        this.io.emit('user:online', {
+        this.io.emit('user:online', PRIVACY_MODE ? {
+          userId: data.userId
+        } : {
           userId: data.userId,
           publicKey: data.publicKey
         });
@@ -193,9 +338,21 @@ class KRIMassRelayServer {
       // KRIPROT: Message relay (ZERO-KNOWLEDGE - server CANNOT decrypt)
       /** @watermark KRIPROT-MESSAGE-RELAY-7f2e9d31 */
       socket.on('message:send', (message: EncryptedMessage) => {
+        const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+        
+        // ✅ ULTRA: Rate limiting check
+        if (sender && !checkRateLimit(sender.id)) {
+          socket.emit('message:error', {
+            code: 'RATE_LIMIT_EXCEEDED',
+            error: 'Занадто багато повідомлень. Спробуйте через хвилину.'
+          });
+          return;
+        }
+        
         const recipient = this.users.get(message.to); // KRIPROT: Find recipient
         
         if (recipient) {
+          this.rememberMessageRoute(message, socket.id);
           // KRIPROT CRITICAL: Relay ONLY encrypted cipher, NEVER decrypt
           this.io.to(recipient.socketId).emit('message:receive', {
             from: message.from, // KRIPROT: Sender ID (routing)
@@ -203,12 +360,14 @@ class KRIMassRelayServer {
             kriKey: message.kriKey, // KRIPROT: КРІ encrypted key
             harmony: message.harmony, // KRIPROT: S=34 checksum validation
             timestamp: message.timestamp, // KRIPROT: Message timestamp
-            nonce: message.nonce // KRIPROT: Cryptographic nonce
+            nonce: message.nonce, // KRIPROT: Cryptographic nonce
+            messageId: message.messageId, // Optional idempotency key
+            groupId: message.groupId
           });
 
           // KRIPROT: Delivery confirmation to sender
           socket.emit('message:delivered', {
-            messageId: message.timestamp,
+            messageId: message.messageId || String(message.timestamp),
             to: message.to,
             timestamp: Date.now()
           });
@@ -222,12 +381,78 @@ class KRIMassRelayServer {
         }
       });
 
+      // Public key on-demand (metadata minimization)
+      socket.on('publicKey:request', (data: { to: string; requestId?: string }) => {
+        try {
+          const requester = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+          if (!requester || !data?.to) return;
+          const target = this.users.get(String(data.to));
+          if (!target) return;
+
+          this.io.to(socket.id).emit('publicKey:response', {
+            userId: target.id,
+            publicKey: target.publicKey,
+            requestId: data.requestId || null,
+            timestamp: Date.now()
+          });
+        } catch {
+          // ignore
+        }
+      });
+
+      // KRIPROT: Recipient ack -> forward to original sender (no message storage, zero-knowledge)
+      socket.on('message:ack', (data: MessageAck) => {
+        try {
+          if (!data || !data.messageId || !data.to || !data.from) return;
+
+          if (!checkEventRateLimit(String(data.from), 'message:ack')) {
+            return;
+          }
+
+          const sender = this.users.get(data.to);
+          if (sender) {
+            this.io.to(sender.socketId).emit('message:ack', {
+              messageId: String(data.messageId),
+              from: String(data.from),
+              to: String(data.to),
+              timestamp: Date.now()
+            });
+            return;
+          }
+
+          // Fallback: route by remembered sender socketId for this messageId.
+          // This fixes rare register/disconnect races in battle-mode E2E without storing plaintext.
+          const mid = String(data.messageId);
+          const route = this.messageRoutes.get(mid);
+          if (!route) return;
+          if (route.senderId !== String(data.to)) return;
+          if (route.recipientId !== String(data.from)) return;
+
+          const targetSocketId = route.senderSocketId;
+          if (!targetSocketId) return;
+          this.io.to(targetSocketId).emit('message:ack', {
+            messageId: mid,
+            from: String(data.from),
+            to: String(data.to),
+            timestamp: Date.now()
+          });
+        } catch {
+          // ignore
+        }
+      });
+
       // KRIPROT: Typing indicator relay
       /** @watermark KRIPROT-TYPING-INDICATOR-b8e3a7f1 */
       socket.on('typing:start', (data: { recipientId: string }) => {
+        const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+        
+        // ✅ 27-MIN SPRINT: Rate limiting for typing
+        if (sender && !checkEventRateLimit(sender.id, 'typing:start')) {
+          return; // Silently ignore spam
+        }
+        
         const recipient = this.users.get(data.recipientId);
         if (recipient) {
-          const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
           this.io.to(recipient.socketId).emit('user:typing', {
             userId: sender?.id,
             isTyping: true
@@ -305,7 +530,13 @@ class KRIMassRelayServer {
         members: string[];
         timestamp: number;
       }) => {
-        console.log(`� Group created: ${data.name} by ${data.createdBy}`);
+        // ✅ 27-MIN SPRINT: Rate limiting for group creation
+        if (!checkEventRateLimit(data.createdBy, 'group:create')) {
+          socket.emit('error', { message: 'Занадто багато груп. Зачекайте 5 хвилин.' });
+          return;
+        }
+        
+        console.log(`👥 Group created: ${data.name} by ${data.createdBy}`);
         // Broadcast to all members
         data.members.forEach(memberId => {
           const member = this.users.get(memberId);
@@ -357,6 +588,10 @@ class KRIMassRelayServer {
         totalChunks: number;
         fileId: string;
       }) => {
+        // Rate limiting (best-effort; server stays zero-knowledge)
+        if (!checkEventRateLimit(String(data.from), 'file:send')) {
+          return;
+        }
         const recipient = this.users.get(data.to);
         if (recipient) {
           this.io.to(recipient.socketId).emit('file:receive', data);
@@ -365,6 +600,12 @@ class KRIMassRelayServer {
       });
 
       socket.on('file:complete', (data: { to: string; fileId: string }) => {
+        try {
+          const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+          if (sender && !checkEventRateLimit(String(sender.id), 'file:send')) {
+            return;
+          }
+        } catch {}
         const recipient = this.users.get(data.to);
         if (recipient) {
           this.io.to(recipient.socketId).emit('file:transfer_complete', data);
@@ -410,6 +651,14 @@ class KRIMassRelayServer {
 
       // P2P обмін ключами
       socket.on('key:exchange', (data: { to: string; publicKey: string; qrData: string }) => {
+        const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+        
+        // ✅ 27-MIN SPRINT: Rate limiting for key exchange
+        if (sender && !checkEventRateLimit(sender.id, 'key:exchange')) {
+          socket.emit('error', { message: 'Занадто багато обмінів ключами. Зачекайте.' });
+          return;
+        }
+        
         const recipient = this.users.get(data.to);
         
         if (recipient) {
@@ -434,6 +683,12 @@ class KRIMassRelayServer {
 
       // Peer discovery
       socket.on('peer:discover', (data: PeerDiscovery) => {
+        // ✅ 27-MIN SPRINT: Rate limiting for peer discovery
+        if (!checkEventRateLimit(data.userId, 'peer:discover')) {
+          socket.emit('error', { message: 'Занадто багато запитів пошуку. Зачекайте.' });
+          return;
+        }
+        
         // Broadcast всім окрім себе
         socket.broadcast.emit('peer:found', {
           userId: data.userId,
@@ -478,6 +733,89 @@ class KRIMassRelayServer {
 
           console.log(`❌ User disconnected: ${user.id}`);
         }
+      });
+
+      // ═══════════════════════════════════════════════════════════════
+      // PROXIMITY RADAR ENDPOINTS (Added 5 Dec 2025)
+      // ═══════════════════════════════════════════════════════════════
+
+      /**
+       * Broadcast присутності користувача
+       * Розсилаємо всім підключеним користувачам
+       */
+      socket.on('nearby:broadcast', (data: {
+        userId: string;
+        encryptedData: string;
+        originalLength: number;
+        timestamp: number;
+      }) => {
+        console.log(`📡 [Radar] Broadcast from ${data.userId}`);
+        
+        // Rate limiting для broadcast (макс 1 на секунду)
+        if (!checkEventRateLimit(data.userId, 'nearby:broadcast')) {
+          socket.emit('error', { message: 'Rate limit exceeded for broadcast' });
+          return;
+        }
+        
+        // Розсилаємо ВСІМ крім відправника (broadcast)
+        socket.broadcast.emit('nearby:broadcast', {
+          userId: data.userId,
+          encryptedData: data.encryptedData,
+          originalLength: data.originalLength,
+          timestamp: data.timestamp
+        });
+        
+        console.log(`✅ [Radar] Broadcasted to all users`);
+      });
+
+      /**
+       * Запит списку користувачів поблизу
+       * Відповідає даними про підключених користувачів
+       */
+      socket.on('nearby:query', (data: {
+        userId: string;
+        timestamp: number;
+      }) => {
+        console.log(`📡 [Radar] Query from ${data.userId}`);
+        
+        // Формуємо список онлайн користувачів
+        const onlineUsers = Array.from(this.users.values())
+          .filter(u => u.id !== data.userId) // Виключаємо себе
+          .map(u => ({
+            userId: u.id,
+            publicKey: u.publicKey,
+            lastSeen: u.lastSeen
+          }));
+        
+        // Відправляємо відповідь
+        socket.emit('nearby:response', {
+          users: onlineUsers,
+          timestamp: Date.now()
+        });
+        
+        console.log(`✅ [Radar] Sent ${onlineUsers.length} users`);
+      });
+
+      /**
+       * Підписка на оновлення радара
+       * Відправляємо користувачу коли хтось з'являється/зникає
+       */
+      socket.on('nearby:subscribe', (data: { userId: string }) => {
+        console.log(`📡 [Radar] ${data.userId} subscribed to radar updates`);
+        
+        // При підписці відправляємо поточний список
+        const onlineUsers = Array.from(this.users.values())
+          .filter(u => u.id !== data.userId)
+          .map(u => ({
+            userId: u.id,
+            publicKey: u.publicKey,
+            lastSeen: u.lastSeen
+          }));
+        
+        socket.emit('nearby:update', {
+          users: onlineUsers,
+          timestamp: Date.now()
+        });
       });
     });
   }
