@@ -315,6 +315,14 @@ class KRIMassRelayServer {
           publicKey: data.publicKey, // KRIPROT: Public key for routing ONLY
           lastSeen: Date.now() // KRIPROT: Timestamp
         };
+
+        // Join a stable room keyed by userId.
+        // This makes delivery/ack robust across reconnects (socketId changes) and supports multi-tab/device.
+        try {
+          socket.join(String(data.userId));
+        } catch {
+          // ignore
+        }
         
         this.users.set(data.userId, user); // KRIPROT: Store in registry
         
@@ -354,6 +362,23 @@ class KRIMassRelayServer {
         if (recipient) {
           this.rememberMessageRoute(message, socket.id);
           // KRIPROT CRITICAL: Relay ONLY encrypted cipher, NEVER decrypt
+          // Prefer stable room delivery; keep socketId delivery as a fallback.
+          try {
+            this.io.to(String(recipient.id)).emit('message:receive', {
+              from: message.from, // KRIPROT: Sender ID (routing)
+              cipher: message.cipher, // KRIPROT: ENCRYPTED - server blind to content
+              kriKey: message.kriKey, // KRIPROT: КРІ encrypted key
+              harmony: message.harmony, // KRIPROT: S=34 checksum validation
+              timestamp: message.timestamp, // KRIPROT: Message timestamp
+              nonce: message.nonce, // KRIPROT: Cryptographic nonce
+              // Always include messageId (fallback to timestamp) so clients can ack reliably.
+              messageId: message.messageId || String(message.timestamp),
+              groupId: message.groupId || null
+            });
+          } catch {
+            // ignore
+          }
+
           this.io.to(recipient.socketId).emit('message:receive', {
             from: message.from, // KRIPROT: Sender ID (routing)
             cipher: message.cipher, // KRIPROT: ENCRYPTED - server blind to content
@@ -424,6 +449,18 @@ class KRIMassRelayServer {
 
           const sender = this.users.get(toId);
           if (sender) {
+            // Prefer room-based delivery to avoid losing acks on reconnect.
+            try {
+              this.io.to(String(toId)).emit('message:ack', {
+                messageId: mid,
+                from: fromId,
+                to: toId,
+                timestamp: Date.now()
+              });
+            } catch {
+              // ignore
+            }
+
             this.io.to(sender.socketId).emit('message:ack', {
               messageId: mid,
               from: fromId,
@@ -465,6 +502,18 @@ class KRIMassRelayServer {
             }
             return;
           }
+          // Prefer room-based delivery; keep socketId fallback.
+          try {
+            this.io.to(String(toId)).emit('message:ack', {
+              messageId: mid,
+              from: fromId,
+              to: toId,
+              timestamp: Date.now()
+            });
+          } catch {
+            // ignore
+          }
+
           this.io.to(targetSocketId).emit('message:ack', {
             messageId: mid,
             from: fromId,
