@@ -33,7 +33,7 @@ Contact: legal@kriprot.com (authorized inquiries ONLY)
 ## 🚀 Deployment (KRIPROT Authorized Only)
 
 ### Render.com (Recommended)
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/HarmoniXgpt/krimass-relay-server)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
 
 **Build Command:**
 ```bash

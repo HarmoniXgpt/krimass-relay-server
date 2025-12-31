@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # KRIMASS Relay Server - Zero-Knowledge WebSocket
+  relay-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: krimass-relay
+    restart: unless-stopped
+    ports:
+      - "3000:3000"  # Development/Cloudflare Tunnel
+      # - "443:443"  # Production HTTPS (якщо Let's Encrypt)
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      # SSL через Cloudflare Tunnel (рекомендовано)
+      - CLOUDFLARE_TUNNEL=true
+    volumes:
+      # Якщо використовуєте Let's Encrypt:
+      # - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ./logs:/app/logs
+    networks:
+      - krimass-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ✅ ОПЦІОНАЛЬНО: Nginx reverse proxy (якщо не Cloudflare)
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: krimass-nginx
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - /etc/letsencrypt:/etc/letsencrypt:ro
+  #   depends_on:
+  #     - relay-server
+  #   networks:
+  #     - krimass-network
+
+networks:
+  krimass-network:
+    driver: bridge
+
+# ✅ QUICK START:
+# 1. docker-compose up -d
+# 2. docker logs -f krimass-relay
+# 3. Test: curl http://localhost:3000/health

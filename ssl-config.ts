@@ -24,18 +24,15 @@ export interface ServerConfig {
  * Production конфігурація (WSS з SSL)
  */
 export const productionConfig: ServerConfig = {
-  // Cloud platforms (Render/Fly/Railway) terminate TLS at the edge and
-  // forward traffic to the app over plain HTTP. Always honor PORT.
-  port: Number(process.env.PORT || 3000),
+  port: 443, // HTTPS standard port
   host: '0.0.0.0',
-  // Enable in-app SSL only if explicitly requested AND cert paths exist.
-  // Default is false for compatibility with managed HTTPS.
-  useSSL: String(process.env.SSL_ENABLED || '').trim() === '1',
+  useSSL: true,
   ssl: {
-    enabled: String(process.env.SSL_ENABLED || '').trim() === '1',
-    keyPath: process.env.SSL_KEY_PATH || '/etc/letsencrypt/live/relay.krimass.app/privkey.pem',
-    certPath: process.env.SSL_CERT_PATH || '/etc/letsencrypt/live/relay.krimass.app/fullchain.pem',
-    caPath: process.env.SSL_CA_PATH || '/etc/letsencrypt/live/relay.krimass.app/chain.pem'
+    enabled: true,
+    // ✅ Let's Encrypt сертифікати (приклад)
+    keyPath: '/etc/letsencrypt/live/relay.krimass.app/privkey.pem',
+    certPath: '/etc/letsencrypt/live/relay.krimass.app/fullchain.pem',
+    caPath: '/etc/letsencrypt/live/relay.krimass.app/chain.pem'
   }
 };
 
@@ -43,7 +40,7 @@ export const productionConfig: ServerConfig = {
  * Development конфігурація (WS без SSL)
  */
 export const developmentConfig: ServerConfig = {
-  port: Number(process.env.PORT || 3000),
+  port: 3000,
   host: 'localhost',
   useSSL: false
 };
@@ -55,7 +52,7 @@ export function getServerConfig(): ServerConfig {
   const env = process.env.NODE_ENV || 'development';
   
   if (env === 'production') {
-    // ✅ Production: prefer managed HTTPS (edge TLS) unless SSL_ENABLED=1
+    // ✅ Production: WSS з SSL
     return productionConfig;
   } else {
     // ✅ Development: WS без SSL

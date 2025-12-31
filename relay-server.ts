@@ -48,10 +48,15 @@ const RATE_LIMITS = {
   'message:ack': { max: 300, window: 60000 },   // 300 ack/хв
   'peer:discover': { max: 20, window: 60000 },  // 20 запитів/хв
   'key:exchange': { max: 10, window: 60000 },   // 10 обмінів/хв
+  // Call signaling can generate multiple messages quickly (offer/answer/ICE).
+  // Keep QR key exchange strict, but allow higher throughput for call signals.
+  'call:signal': { max: 300, window: 60000 },   // 300 сигналів/хв
   'typing:start': { max: 50, window: 60000 },   // 50 typing/хв
   'group:create': { max: 5, window: 300000 },   // 5 груп за 5 хв
   'file:send': { max: 20, window: 60000 }       // 20 файлів/хв
 };
+
+const MESSAGE_ROUTE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 const eventCounts = new Map<string, Map<string, { count: number; resetTime: number }>>();
 
@@ -119,6 +124,19 @@ interface MessageAck {
   timestamp: number;
 }
 
+/** @watermark KRIPROT-ACK-TYPE */
+interface MessageAck {
+  // NOTE: payload keys are intentionally flexible for backward compatibility
+  toId?: string;
+  to?: string;
+  fromId?: string;
+  from?: string;
+  messageId?: string | number;
+  id?: string | number;
+  timestamp?: number;
+  groupId?: string;
+}
+
 /** @watermark KRIPROT-DISCOVERY-TYPE */
 interface PeerDiscovery {
   userId: string; // KRIPROT: User seeking peers
@@ -138,6 +156,10 @@ class KRIMassRelayServer {
   private server: any; // KRIPROT: HTTP server
   private io: SocketIOServer; // KRIPROT: Socket.IO WebSocket server
   private users: Map<string, User>; // KRIPROT: In-memory user registry (Zero-Knowledge)
+  private messageRoutes: Map<
+    string,
+    { senderId: string; senderSocketId: string; recipientId: string; createdAt: number }
+  >;
   private port: number; // KRIPROT: Server port
   private messageRoutes: Map<string, { senderId: string; senderSocketId: string; recipientId: string; createdAt: number }>;
 
@@ -234,7 +256,7 @@ class KRIMassRelayServer {
         status: 'online', // KRIPROT: Server status
         users: this.users.size, // KRIPROT: Active users count
         timestamp: Date.now(), // KRIPROT: Current timestamp
-        version: '2.0.1', // KRIPROT: Server version
+        version: '2.0.2', // KRIPROT: Server version
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
@@ -325,6 +347,9 @@ class KRIMassRelayServer {
         }
         
         this.users.set(data.userId, user); // KRIPROT: Store in registry
+
+        // ✅ PRODUCTION RELIABILITY: stable room per userId (survives reconnect/socketId churn)
+        socket.join(String(data.userId));
         
         socket.emit('registered', {
           success: true,
@@ -347,7 +372,7 @@ class KRIMassRelayServer {
       /** @watermark KRIPROT-MESSAGE-RELAY-7f2e9d31 */
       socket.on('message:send', (message: EncryptedMessage) => {
         const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
-        
+
         // ✅ ULTRA: Rate limiting check
         if (sender && !checkRateLimit(sender.id)) {
           socket.emit('message:error', {
@@ -356,30 +381,38 @@ class KRIMassRelayServer {
           });
           return;
         }
-        
+
         const recipient = this.users.get(message.to); // KRIPROT: Find recipient
-        
+        const messageId = String((message as any).messageId ?? message.timestamp);
+
+        // Opportunistic cleanup to avoid unbounded growth.
+        if (this.messageRoutes.size > 5000) {
+          const now = Date.now();
+          for (const [id, route] of this.messageRoutes) {
+            if (now - route.createdAt > MESSAGE_ROUTE_TTL_MS) {
+              this.messageRoutes.delete(id);
+            }
+          }
+        }
+
+        // Keep a short-lived route hint to deliver ACKs even if user map is briefly stale.
+        this.messageRoutes.set(messageId, {
+          senderId: message.from,
+          senderSocketId: socket.id,
+          recipientId: message.to,
+          createdAt: Date.now()
+        });
+
         if (recipient) {
           this.rememberMessageRoute(message, socket.id);
           // KRIPROT CRITICAL: Relay ONLY encrypted cipher, NEVER decrypt
-          // Prefer stable room delivery; keep socketId delivery as a fallback.
-          try {
-            this.io.to(String(recipient.id)).emit('message:receive', {
-              from: message.from, // KRIPROT: Sender ID (routing)
-              cipher: message.cipher, // KRIPROT: ENCRYPTED - server blind to content
-              kriKey: message.kriKey, // KRIPROT: КРІ encrypted key
-              harmony: message.harmony, // KRIPROT: S=34 checksum validation
-              timestamp: message.timestamp, // KRIPROT: Message timestamp
-              nonce: message.nonce, // KRIPROT: Cryptographic nonce
-              // Always include messageId (fallback to timestamp) so clients can ack reliably.
-              messageId: message.messageId || String(message.timestamp),
-              groupId: message.groupId || null
-            });
-          } catch {
-            // ignore
-          }
+          // Prefer userId-room delivery; fallback to socketId only if room is empty.
+          // Avoid double-delivery: do NOT emit to both room and socketId.
+          const roomId = String(recipient.id);
+          const room = this.io.sockets.adapter.rooms.get(roomId);
+          const target = room && room.size > 0 ? roomId : recipient.socketId;
 
-          this.io.to(recipient.socketId).emit('message:receive', {
+          this.io.to(target).emit('message:receive', {
             from: message.from, // KRIPROT: Sender ID (routing)
             cipher: message.cipher, // KRIPROT: ENCRYPTED - server blind to content
             kriKey: message.kriKey, // KRIPROT: КРІ encrypted key
@@ -427,13 +460,14 @@ class KRIMassRelayServer {
       });
 
       // KRIPROT: Recipient ack -> forward to original sender (no message storage, zero-knowledge)
-      socket.on('message:ack', (data: MessageAck) => {
+      // Accept both {from,to} and legacy-ish {fromId,toId} shapes.
+      socket.on('message:ack', (ack: MessageAck) => {
         try {
-          if (!data || !data.messageId || !data.to || !data.from) return;
+          const mid = String((ack as any).messageId ?? (ack as any).id ?? (ack as any).timestamp ?? '');
+          const fromId = String((ack as any).from ?? (ack as any).fromId ?? '');
+          const toId = String((ack as any).to ?? (ack as any).toId ?? '');
+          if (!mid || !fromId || !toId) return;
 
-          const mid = String(data.messageId);
-          const fromId = String(data.from);
-          const toId = String(data.to);
           const debugAck = process.env.KRIMASS_DEBUG_ACK === '1';
 
           if (!checkEventRateLimit(fromId, 'message:ack')) {
@@ -443,85 +477,26 @@ class KRIMassRelayServer {
             return;
           }
 
-          if (debugAck) {
-            console.log(`✅ KRIPROT: Ack received: mid=${mid} from=${fromId} to=${toId}`);
-          }
-
-          const sender = this.users.get(toId);
-          if (sender) {
-            // Prefer room-based delivery to avoid losing acks on reconnect.
-            try {
-              this.io.to(String(toId)).emit('message:ack', {
-                messageId: mid,
-                from: fromId,
-                to: toId,
-                timestamp: Date.now()
-              });
-            } catch {
-              // ignore
-            }
-
-            this.io.to(sender.socketId).emit('message:ack', {
-              messageId: mid,
-              from: fromId,
-              to: toId,
-              timestamp: Date.now()
-            });
-            if (debugAck) {
-              console.log(`↩️  KRIPROT: Ack forwarded (direct): mid=${mid} toSocket=${sender.socketId}`);
-            }
-            return;
-          }
-
-          // Fallback: route by remembered sender socketId for this messageId.
-          // This fixes rare register/disconnect races in battle-mode E2E without storing plaintext.
-          const route = this.messageRoutes.get(mid);
-          if (!route) {
-            if (debugAck) {
-              console.log(`⚠️  KRIPROT: Ack fallback miss: mid=${mid} (no route)`);
-            }
-            return;
-          }
-          if (route.senderId !== toId) {
-            if (debugAck) {
-              console.log(`⚠️  KRIPROT: Ack fallback reject: mid=${mid} senderId mismatch route=${route.senderId} data.to=${toId}`);
-            }
-            return;
-          }
-          if (route.recipientId !== fromId) {
-            if (debugAck) {
-              console.log(`⚠️  KRIPROT: Ack fallback reject: mid=${mid} recipientId mismatch route=${route.recipientId} data.from=${fromId}`);
-            }
-            return;
-          }
-
-          const targetSocketId = route.senderSocketId;
-          if (!targetSocketId) {
-            if (debugAck) {
-              console.log(`⚠️  KRIPROT: Ack fallback miss: mid=${mid} (no senderSocketId)`);
-            }
-            return;
-          }
-          // Prefer room-based delivery; keep socketId fallback.
-          try {
-            this.io.to(String(toId)).emit('message:ack', {
-              messageId: mid,
-              from: fromId,
-              to: toId,
-              timestamp: Date.now()
-            });
-          } catch {
-            // ignore
-          }
-
-          this.io.to(targetSocketId).emit('message:ack', {
+          const payload = {
             messageId: mid,
             from: fromId,
             to: toId,
             timestamp: Date.now()
-          });
-          if (debugAck) {
-            console.log(`↩️  KRIPROT: Ack forwarded (fallback): mid=${mid} toSocket=${targetSocketId}`);
+          };
+
+          // Prefer stable room delivery; fallback to socketId only if room empty.
+          const room = this.io.sockets.adapter.rooms.get(toId);
+          const recipient = this.users.get(toId);
+          const target = room && room.size > 0 ? toId : recipient?.socketId;
+          if (target) {
+            this.io.to(target).emit('message:ack', payload);
+            return;
+          }
+
+          // Last-resort fallback using route hint.
+          const route = this.messageRoutes.get(mid);
+          if (route?.senderSocketId) {
+            this.io.to(route.senderSocketId).emit('message:ack', payload);
           }
         } catch {
           // ignore
@@ -741,7 +716,11 @@ class KRIMassRelayServer {
         const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
         
         // ✅ 27-MIN SPRINT: Rate limiting for key exchange
-        if (sender && !checkEventRateLimit(sender.id, 'key:exchange')) {
+        // Calls can tunnel signaling via qrData.callSignal; allow higher throughput for that.
+        const qr = (data && typeof data.qrData === 'string') ? data.qrData : '';
+        const isCallSignal = qr.includes('"callSignal"') || qr.includes("'callSignal'");
+        const limitEvent = isCallSignal ? 'call:signal' : 'key:exchange';
+        if (sender && !checkEventRateLimit(sender.id, limitEvent)) {
           socket.emit('error', { message: 'Занадто багато обмінів ключами. Зачекайте.' });
           return;
         }
@@ -750,7 +729,8 @@ class KRIMassRelayServer {
         
         if (recipient) {
           this.io.to(recipient.socketId).emit('key:received', {
-            from: socket.id,
+            // Use stable userId when available (socket.id breaks cross-device identity)
+            from: sender?.id || socket.id,
             publicKey: data.publicKey,
             qrData: data.qrData,
             timestamp: Date.now()
