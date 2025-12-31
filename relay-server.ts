@@ -31,7 +31,7 @@ Contact: legal@kriprot.com (authorized inquiries ONLY)
 import express from 'express';
 import { createServer } from 'http';
 import { createServer as createHttpsServer } from 'https';
-import { Server as SocketIOServer } from 'socket.io';
+import { Server as SocketIOServer, type Socket } from 'socket.io';
 import cors from 'cors';
 import fs from 'fs';
 // ✅ 27-MIN SPRINT: WSS Configuration
@@ -117,15 +117,7 @@ interface EncryptedMessage {
 }
 
 /** @watermark KRIPROT-MESSAGE-ACK-TYPE */
-interface MessageAck {
-  messageId: string;
-  from: string; // ack sender (recipient of original message)
-  to: string;   // original sender
-  timestamp: number;
-}
-
-/** @watermark KRIPROT-ACK-TYPE */
-interface MessageAck {
+type MessageAckPayload = {
   // NOTE: payload keys are intentionally flexible for backward compatibility
   toId?: string;
   to?: string;
@@ -135,7 +127,14 @@ interface MessageAck {
   id?: string | number;
   timestamp?: number;
   groupId?: string;
-}
+};
+
+type MessageAckNormalized = {
+  messageId: string;
+  from: string; // ack sender (recipient of original message)
+  to: string;   // original sender
+  timestamp: number;
+};
 
 /** @watermark KRIPROT-DISCOVERY-TYPE */
 interface PeerDiscovery {
@@ -161,7 +160,6 @@ class KRIMassRelayServer {
     { senderId: string; senderSocketId: string; recipientId: string; createdAt: number }
   >;
   private port: number; // KRIPROT: Server port
-  private messageRoutes: Map<string, { senderId: string; senderSocketId: string; recipientId: string; createdAt: number }>;
 
   /** @watermark KRIPROT-CONSTRUCTOR */
   constructor(port?: number) {
@@ -316,7 +314,7 @@ class KRIMassRelayServer {
    */
   private setupWebSocket() {
     /** @watermark KRIPROT-CONNECTION-HANDLER */
-    this.io.on('connection', (socket) => {
+    this.io.on('connection', (socket: Socket) => {
       console.log(`✅ KRIPROT: User connected: ${socket.id}`);
 
       // KRIPROT: User registration endpoint
@@ -461,7 +459,7 @@ class KRIMassRelayServer {
 
       // KRIPROT: Recipient ack -> forward to original sender (no message storage, zero-knowledge)
       // Accept both {from,to} and legacy-ish {fromId,toId} shapes.
-      socket.on('message:ack', (ack: MessageAck) => {
+      socket.on('message:ack', (ack: MessageAckPayload) => {
         try {
           const mid = String((ack as any).messageId ?? (ack as any).id ?? (ack as any).timestamp ?? '');
           const fromId = String((ack as any).from ?? (ack as any).fromId ?? '');
@@ -477,7 +475,7 @@ class KRIMassRelayServer {
             return;
           }
 
-          const payload = {
+          const payload: MessageAckNormalized = {
             messageId: mid,
             from: fromId,
             to: toId,
