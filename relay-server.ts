@@ -254,7 +254,7 @@ class KRIMassRelayServer {
         status: 'online', // KRIPROT: Server status
         users: this.users.size, // KRIPROT: Active users count
         timestamp: Date.now(), // KRIPROT: Current timestamp
-        version: '2.0.2', // KRIPROT: Server version
+        version: '2.0.4', // KRIPROT: Server version
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
