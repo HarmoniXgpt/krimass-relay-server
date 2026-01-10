@@ -34,6 +34,7 @@ import { createServer as createHttpsServer } from 'https';
 import { Server as SocketIOServer, type Socket } from 'socket.io';
 import cors from 'cors';
 import fs from 'fs';
+import webpush from 'web-push';
 // ✅ 27-MIN SPRINT: WSS Configuration
 import { getServerConfig } from './ssl-config';
 
@@ -101,6 +102,7 @@ interface User {
   socketId: string; // KRIPROT: WebSocket connection ID
   publicKey: string; // KRIPROT: Public key for routing only
   lastSeen: number; // KRIPROT: Timestamp for presence
+  displayName?: string; // KRIPROT: Optional display name (user-set, not ID)
 }
 
 /** @watermark KRIPROT-MESSAGE-TYPE */
@@ -115,6 +117,9 @@ interface EncryptedMessage {
   messageId?: string; // Optional idempotency key for retries/dedup (no plaintext)
   groupId?: string; // Optional group routing hint (still E2E encrypted per-recipient)
 }
+
+// Web Push subscription payload (no secrets).
+type WebPushSubscription = any;
 
 /** @watermark KRIPROT-MESSAGE-ACK-TYPE */
 type MessageAckPayload = {
@@ -159,6 +164,9 @@ class KRIMassRelayServer {
     string,
     { senderId: string; senderSocketId: string; recipientId: string; createdAt: number }
   >;
+  private groupSubscribers: Map<string, Set<string>>; // groupId -> Set<userId> (in-memory)
+  private webPushSubscriptions: Map<string, WebPushSubscription>;
+  private webPushConfigured: boolean | null;
   private port: number; // KRIPROT: Server port
 
   /** @watermark KRIPROT-CONSTRUCTOR */
@@ -195,6 +203,9 @@ class KRIMassRelayServer {
     });
     this.users = new Map(); // KRIPROT: Initialize user registry
     this.messageRoutes = new Map();
+    this.groupSubscribers = new Map();
+    this.webPushSubscriptions = new Map();
+    this.webPushConfigured = null;
 
     this.setupMiddleware();
     this.setupRoutes();
@@ -231,6 +242,39 @@ class KRIMassRelayServer {
     }
   }
 
+  private ensureGroupSubscriberSet(groupId: string): Set<string> {
+    const gid = String(groupId || '').trim();
+    if (!gid) return new Set<string>();
+    let set = this.groupSubscribers.get(gid);
+    if (!set) {
+      set = new Set<string>();
+      this.groupSubscribers.set(gid, set);
+    }
+    return set;
+  }
+
+  private getSubscriberCount(groupId: string): number {
+    try {
+      const gid = String(groupId || '').trim();
+      if (!gid) return 0;
+      const set = this.groupSubscribers.get(gid);
+      return set ? set.size : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private emitSubscriberCountUpdate(groupId: string) {
+    try {
+      const gid = String(groupId || '').trim();
+      if (!gid) return;
+      const count = this.getSubscriberCount(gid);
+      this.io.emit('group:subscriber_count:updated', { groupId: gid, count, timestamp: Date.now() });
+    } catch {
+      // ignore
+    }
+  }
+
   /**
    * KRIPROT Middleware Setup
    * @watermark KRIPROT-MIDDLEWARE-f8a2c1d9
@@ -254,7 +298,7 @@ class KRIMassRelayServer {
         status: 'online', // KRIPROT: Server status
         users: this.users.size, // KRIPROT: Active users count
         timestamp: Date.now(), // KRIPROT: Current timestamp
-        version: '2.0.4', // KRIPROT: Server version
+        version: '2.0.6', // KRIPROT: Server version
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
@@ -304,6 +348,109 @@ class KRIMassRelayServer {
         res.json({ found: false });
       }
     });
+
+    // Web Push: public VAPID key (not a secret). Useful for iOS PWA subscription.
+    this.app.get('/webpush/publicKey', (req, res) => {
+      const key = String(
+        process.env.WEBPUSH_VAPID_PUBLIC_KEY
+          || process.env.VAPID_PUBLIC_KEY
+          || process.env.KRIMASS_WEBPUSH_PUBLIC_KEY
+          || ''
+      ).trim();
+      if (!key) {
+        res.status(404).json({ ok: false, error: 'WEBPUSH_VAPID_PUBLIC_KEY not configured' });
+        return;
+      }
+      res.json({ ok: true, publicKey: key });
+    });
+
+    // Web Push: store subscription (in-memory). Client must re-register on restart.
+    this.app.post('/webpush/subscribe', (req, res) => {
+      try {
+        const userId = req && req.body && req.body.userId ? String(req.body.userId) : '';
+        const subscription = req && req.body ? (req.body.subscription || null) : null;
+        if (!userId || !subscription) {
+          res.status(400).json({ ok: false, error: 'Missing userId/subscription' });
+          return;
+        }
+        this.webPushSubscriptions.set(userId, subscription);
+        res.json({ ok: true });
+      } catch (e: any) {
+        res.status(500).json({ ok: false, error: String(e && e.message ? e.message : e) });
+      }
+    });
+
+    this.app.post('/webpush/unsubscribe', (req, res) => {
+      try {
+        const userId = req && req.body && req.body.userId ? String(req.body.userId) : '';
+        if (!userId) {
+          res.status(400).json({ ok: false, error: 'Missing userId' });
+          return;
+        }
+        this.webPushSubscriptions.delete(userId);
+        res.json({ ok: true });
+      } catch (e: any) {
+        res.status(500).json({ ok: false, error: String(e && e.message ? e.message : e) });
+      }
+    });
+  }
+
+  private initWebPushIfPossible(): boolean {
+    if (this.webPushConfigured !== null) return this.webPushConfigured;
+
+    const publicKey = String(
+      process.env.WEBPUSH_VAPID_PUBLIC_KEY
+        || process.env.VAPID_PUBLIC_KEY
+        || process.env.KRIMASS_WEBPUSH_PUBLIC_KEY
+        || ''
+    ).trim();
+    const privateKey = String(
+      process.env.WEBPUSH_VAPID_PRIVATE_KEY
+        || process.env.VAPID_PRIVATE_KEY
+        || process.env.KRIMASS_WEBPUSH_PRIVATE_KEY
+        || ''
+    ).trim();
+    const subject = String(
+      process.env.WEBPUSH_SUBJECT
+        || process.env.WEBPUSH_VAPID_SUBJECT
+        || process.env.KRIMASS_WEBPUSH_SUBJECT
+        || 'mailto:admin@krimass.local'
+    ).trim();
+
+    if (!publicKey || !privateKey) {
+      this.webPushConfigured = false;
+      return false;
+    }
+
+    try {
+      webpush.setVapidDetails(subject, publicKey, privateKey);
+      this.webPushConfigured = true;
+      return true;
+    } catch {
+      this.webPushConfigured = false;
+      return false;
+    }
+  }
+
+  private async sendWebPushIfPossible(userId: string, payload: any): Promise<void> {
+    try {
+      const uid = String(userId || '').trim();
+      if (!uid) return;
+      if (!this.initWebPushIfPossible()) return;
+      const sub = this.webPushSubscriptions.get(uid);
+      if (!sub) return;
+
+      const body = JSON.stringify(payload || {});
+      await webpush.sendNotification(sub, body, { TTL: 60 });
+    } catch (e: any) {
+      // If subscription is gone, delete it.
+      try {
+        const code = e && (e.statusCode || e.status);
+        if (code === 404 || code === 410) {
+          this.webPushSubscriptions.delete(String(userId));
+        }
+      } catch {}
+    }
   }
 
   /**
@@ -319,7 +466,7 @@ class KRIMassRelayServer {
 
       // KRIPROT: User registration endpoint
       /** @watermark KRIPROT-REGISTER-EVENT-a3c7f912 */
-      socket.on('register', (data: { userId: string; publicKey: string }) => {
+      socket.on('register', (data: { userId: string; publicKey: string; displayName?: string }) => {
         // ✅ ULTRA CACHE: Rate limit для register
         if (!checkEventRateLimit(data.userId, 'register')) {
           socket.emit('register:error', {
@@ -333,7 +480,8 @@ class KRIMassRelayServer {
           id: data.userId, // KRIPROT: User identifier
           socketId: socket.id, // KRIPROT: WebSocket connection ID
           publicKey: data.publicKey, // KRIPROT: Public key for routing ONLY
-          lastSeen: Date.now() // KRIPROT: Timestamp
+          lastSeen: Date.now(), // KRIPROT: Timestamp
+          displayName: data.displayName || undefined // KRIPROT: Optional display name
         };
 
         // Join a stable room keyed by userId.
@@ -360,7 +508,8 @@ class KRIMassRelayServer {
           userId: data.userId
         } : {
           userId: data.userId,
-          publicKey: data.publicKey
+          publicKey: data.publicKey,
+          displayName: user.displayName || undefined
         });
 
         console.log(`👤 KRIPROT: User registered: ${data.userId}`);
@@ -431,6 +580,15 @@ class KRIMassRelayServer {
 
           console.log(`📨 KRIPROT: Message relayed: ${message.from} → ${message.to}`);
         } else {
+          // Best-effort Web Push for offline recipient (zero-knowledge payload).
+          try {
+            void this.sendWebPushIfPossible(String(message.to), {
+              type: 'message',
+              from: String(message.from || ''),
+              groupId: (message as any).groupId ? String((message as any).groupId) : '',
+              timestamp: Number((message as any).timestamp || Date.now())
+            });
+          } catch {}
           socket.emit('message:error', {
             error: 'Recipient not found',
             to: message.to
@@ -539,9 +697,20 @@ class KRIMassRelayServer {
           const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
           this.io.to(recipient.socketId).emit('webrtc:offer', {
             from: sender?.id,
-            offer: data.offer
+            offer: data.offer,
+            callerName: sender?.displayName || undefined
           });
-          console.log(`📹 WebRTC offer: ${sender?.id} → ${data.to}`);
+          console.log(`📹 WebRTC offer: ${sender?.id} (${sender?.displayName || 'no name'}) → ${data.to}`);
+        } else {
+          // Best-effort Web Push for incoming call when recipient is offline.
+          try {
+            const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+            void this.sendWebPushIfPossible(String(data.to), {
+              type: 'call',
+              from: String(sender?.id || ''),
+              timestamp: Date.now()
+            });
+          } catch {}
         }
       });
 
@@ -597,6 +766,23 @@ class KRIMassRelayServer {
         }
         
         console.log(`👥 Group created: ${data.name} by ${data.createdBy}`);
+
+        // Track subscribers (best-effort, in-memory)
+        try {
+          const gid = String(data.groupId || '').trim();
+          if (gid) {
+            const set = this.ensureGroupSubscriberSet(gid);
+            const members = Array.isArray(data.members) ? data.members : [];
+            for (const m of members) {
+              const id = String(m || '').trim();
+              if (id) set.add(id);
+            }
+            this.emitSubscriberCountUpdate(gid);
+          }
+        } catch {
+          // ignore
+        }
+
         // Broadcast to all members
         data.members.forEach(memberId => {
           const member = this.users.get(memberId);
@@ -611,6 +797,19 @@ class KRIMassRelayServer {
         userId: string;
         addedBy: string;
       }) => {
+        // Track subscribers (best-effort, in-memory)
+        try {
+          const gid = String(data.groupId || '').trim();
+          const uid = String(data.userId || '').trim();
+          if (gid && uid) {
+            const set = this.ensureGroupSubscriberSet(gid);
+            set.add(uid);
+            this.emitSubscriberCountUpdate(gid);
+          }
+        } catch {
+          // ignore
+        }
+
         const member = this.users.get(data.userId);
         if (member) {
           this.io.to(member.socketId).emit('group:invitation', data);
@@ -631,8 +830,60 @@ class KRIMassRelayServer {
       });
 
       socket.on('group:leave', (data: { groupId: string; userId: string }) => {
+        // Track subscribers (best-effort, in-memory)
+        try {
+          const gid = String(data.groupId || '').trim();
+          const uid = String(data.userId || '').trim();
+          if (gid && uid) {
+            const set = this.ensureGroupSubscriberSet(gid);
+            set.delete(uid);
+            this.emitSubscriberCountUpdate(gid);
+          }
+        } catch {
+          // ignore
+        }
+
         socket.broadcast.emit('group:member_left', data);
         console.log(`👋 Left group: ${data.userId} from ${data.groupId}`);
+      });
+
+      // Channels/groups: best-effort subscribe/unsubscribe + subscriber count query
+      socket.on('group:subscribe', (data: { groupId: string; userId: string }) => {
+        try {
+          const gid = String(data.groupId || '').trim();
+          const uid = String(data.userId || '').trim();
+          if (!gid || !uid) return;
+          const set = this.ensureGroupSubscriberSet(gid);
+          set.add(uid);
+          this.emitSubscriberCountUpdate(gid);
+        } catch {
+          // ignore
+        }
+      });
+
+      socket.on('group:unsubscribe', (data: { groupId: string; userId: string }) => {
+        try {
+          const gid = String(data.groupId || '').trim();
+          const uid = String(data.userId || '').trim();
+          if (!gid || !uid) return;
+          const set = this.ensureGroupSubscriberSet(gid);
+          set.delete(uid);
+          this.emitSubscriberCountUpdate(gid);
+        } catch {
+          // ignore
+        }
+      });
+
+      socket.on('group:subscriber_count:request', (data: { groupId: string; requestId: string }) => {
+        try {
+          const gid = String(data.groupId || '').trim();
+          const rid = String(data.requestId || '').trim();
+          if (!gid || !rid) return;
+          const count = this.getSubscriberCount(gid);
+          socket.emit('group:subscriber_count:response', { groupId: gid, requestId: rid, count, timestamp: Date.now() });
+        } catch {
+          // ignore
+        }
       });
 
       // ✅ ULTRA SPRINT 3: File Sharing - Binary relay

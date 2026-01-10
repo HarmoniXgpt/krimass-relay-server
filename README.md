@@ -25,6 +25,7 @@ Contact: legal@kriprot.com (authorized inquiries ONLY)
 ### ⚠️ КРИТИЧНО: Zero-Knowledge Architecture
 
 Сервер:
+
 - ✅ **НЕ декриптує** повідомлення (математично неможливо)
 - ✅ Тільки передає зашифровані дані між користувачами
 - ✅ Не зберігає контент (In-Memory тільки)
@@ -33,19 +34,23 @@ Contact: legal@kriprot.com (authorized inquiries ONLY)
 ## 🚀 Deployment (KRIPROT Authorized Only)
 
 ### Render.com (Recommended)
+
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
 
 **Build Command:**
+
 ```bash
 npm install && npm run build
 ```
 
 **Start Command:**
+
 ```bash
 node dist/relay-server.js
 ```
 
 ### Manual
+
 ```bash
 npm install
 npm run build
@@ -55,11 +60,13 @@ npm start
 ## 📡 API
 
 ### HTTP Endpoints
+
 - `GET /health` - Server status
 - `GET /users/online` - Online users list
 - `POST /users/find` - Find user by publicKey
 
 ### WebSocket Events
+
 - `register` - User connects
 - `message:send` - Send encrypted message
 - `message:receive` - Receive encrypted message
@@ -69,11 +76,13 @@ npm start
 ## 🔐 Security
 
 **Server знає:**
+
 - ✅ userId + publicKey (routing)
 - ✅ Хто онлайн (socketId)
 - ✅ S=34 checksum (public validation)
 
 **Server НЕ знає:**
+
 - ❌ Текст повідомлень
 - ❌ Контакти
 - ❌ Приватні ключі
@@ -87,9 +96,9 @@ npm start
 
 ## 🌐 Live
 
-Deployed at: https://krimass-relay-server.onrender.com
+Deployed at: <https://krimass-relay-server.onrender.com>
 
-**Client:** https://krimass-messenger.vercel.app
+**Client:** <https://krimass-messenger.vercel.app>
 
 ---
 

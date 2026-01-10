@@ -63,6 +63,7 @@ KRIPROT retains exclusive rights to:
 ═══════════════════════════════════════════════════════════════════════
 
 Protected under:
+
 - U.S. Trade Secrets Act (18 U.S.C. § 1836)
 - EU Trade Secrets Directive (2016/943)
 - WIPO Copyright Treaty
@@ -74,9 +75,9 @@ Protected under:
 ═══════════════════════════════════════════════════════════════════════
 
 For licensing inquiries ONLY:
-Email: legal@kriprot.com
+Email: <legal@kriprot.com>
 Owner: KRIPROT
-Website: https://kriprot.com
+Website: <https://kriprot.com>
 
 UNAUTHORIZED CONTACT WILL BE REPORTED TO AUTHORITIES.
 
