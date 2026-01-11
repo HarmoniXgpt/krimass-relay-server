@@ -1,6 +1,6 @@
 {
   "name": "krimass-relay-server",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "🔐 KRIPROT Proprietary Relay Server - Zero-Knowledge WebSocket (CONFIDENTIAL)",
   "main": "dist/relay-server.js",
   "private": true,

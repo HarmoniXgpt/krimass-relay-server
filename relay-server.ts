@@ -43,6 +43,29 @@ import { getServerConfig } from './ssl-config';
 // When enabled, the relay avoids broadcasting public keys and reduces online user enumeration.
 const PRIVACY_MODE = String(process.env.KRIMASS_PRIVACY || process.env.RELAY_PRIVACY_MODE || '').trim() === '1';
 
+// Debug logging (opt-in). Keep metadata out of logs by default.
+const DEBUG_LOGS = String(process.env.KRIMASS_DEBUG || process.env.RELAY_DEBUG || '').trim() === '1';
+
+function redactLogValue(value: unknown): string {
+  const s = String(value ?? '');
+  if (!s) return '';
+  if (s.length <= 6) return '***';
+  return `${s.slice(0, 2)}…${s.slice(-2)}`;
+}
+
+function logEvent(message: string, meta?: Record<string, unknown>): void {
+  if (!DEBUG_LOGS || !meta) {
+    console.log(message);
+    return;
+  }
+
+  const parts = Object.entries(meta)
+    .filter(([_, v]) => v !== undefined && v !== null && String(v) !== '')
+    .map(([k, v]) => `${k}=${redactLogValue(v)}`);
+
+  console.log(parts.length ? `${message} (${parts.join(' ')})` : message);
+}
+
 // ✅ ULTRA CACHE PRODUCTION: Rate Limiting для ВСІХ подій
 // ✅ v3.3.0: Збільшено до Signal-рівня (10 msg/sec)
 // 🔒 CRITICAL FIX: DOS Protection для груп
@@ -325,7 +348,7 @@ class KRIMassRelayServer {
         status: 'online', // KRIPROT: Server status
         users: this.users.size, // KRIPROT: Active users count
         timestamp: Date.now(), // KRIPROT: Current timestamp
-        version: '2.2.0', // ✅ v3.3.0: Server version (10/10 security!)
+        version: '2.2.1', // ✅ v3.3.0: Server version (10/10 security!)
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
@@ -489,7 +512,7 @@ class KRIMassRelayServer {
   private setupWebSocket() {
     /** @watermark KRIPROT-CONNECTION-HANDLER */
     this.io.on('connection', (socket: Socket) => {
-      console.log(`✅ KRIPROT: User connected: ${socket.id}`);
+      logEvent('✅ KRIPROT: User connected', { socketId: socket.id });
 
       // KRIPROT: User registration endpoint
       /** @watermark KRIPROT-REGISTER-EVENT-a3c7f912 */
@@ -541,7 +564,7 @@ class KRIMassRelayServer {
           displayName: user.displayName || undefined
         });
 
-        console.log(`👤 KRIPROT: User registered: ${data.userId}`);
+        logEvent('👤 KRIPROT: User registered', { userId: data.userId });
       });
 
       // KRIPROT: Message relay (ZERO-KNOWLEDGE - server CANNOT decrypt)
@@ -611,7 +634,7 @@ class KRIMassRelayServer {
             timestamp: Date.now()
           });
 
-          console.log(`📨 KRIPROT: Message relayed: ${message.from} → ${message.to}`);
+          logEvent('📨 KRIPROT: Message relayed', { from: message.from, to: message.to });
         } else {
           // Best-effort Web Push for offline recipient (zero-knowledge payload).
           try {
@@ -661,7 +684,7 @@ class KRIMassRelayServer {
 
           if (!checkEventRateLimit(fromId, 'message:ack')) {
             if (debugAck) {
-              console.log(`⏳ KRIPROT: Ack rate-limited: mid=${mid} from=${fromId} to=${toId}`);
+              logEvent('⏳ KRIPROT: Ack rate-limited', { mid, from: fromId, to: toId });
             }
             return;
           }
@@ -733,7 +756,7 @@ class KRIMassRelayServer {
             offer: data.offer,
             callerName: sender?.displayName || undefined
           });
-          console.log(`📹 WebRTC offer: ${sender?.id} (${sender?.displayName || 'no name'}) → ${data.to}`);
+          logEvent('📹 WebRTC offer', { from: sender?.id, to: data.to });
         } else {
           // Best-effort Web Push for incoming call when recipient is offline.
           try {
@@ -755,7 +778,7 @@ class KRIMassRelayServer {
             from: sender?.id,
             answer: data.answer
           });
-          console.log(`📹 WebRTC answer: ${sender?.id} → ${data.to}`);
+          logEvent('📹 WebRTC answer', { from: sender?.id, to: data.to });
         }
       });
 
@@ -777,7 +800,7 @@ class KRIMassRelayServer {
           this.io.to(recipient.socketId).emit('webrtc:hangup', {
             from: sender?.id
           });
-          console.log(`📵 WebRTC hangup: ${sender?.id} → ${data.to}`);
+          logEvent('📵 WebRTC hangup', { from: sender?.id, to: data.to });
         }
       });
 
@@ -826,7 +849,7 @@ class KRIMassRelayServer {
         // ✅ Інкремент лічильника груп для користувача
         userGroupCounts.set(uid, userCount + 1);
         
-        console.log(`👥 Group created: ${data.name} by ${data.createdBy}`);
+        logEvent('👥 Group created', { createdBy: data.createdBy });
 
         // Track subscribers (best-effort, in-memory)
         try {
@@ -874,7 +897,7 @@ class KRIMassRelayServer {
         const member = this.users.get(data.userId);
         if (member) {
           this.io.to(member.socketId).emit('group:invitation', data);
-          console.log(`👤 Added to group: ${data.userId} → ${data.groupId}`);
+          logEvent('👤 Added to group', { userId: data.userId, groupId: data.groupId });
         }
       });
 
@@ -909,7 +932,7 @@ class KRIMassRelayServer {
         
         // Broadcast to all users (they filter by groupId locally)
         socket.broadcast.emit('group:message_received', data);
-        console.log(`💬 Group message: ${data.from} → ${data.groupId} (S=${data.harmony})`);
+        logEvent('💬 Group message', { from: data.from, groupId: data.groupId });
       });
 
       socket.on('group:leave', (data: { groupId: string; userId: string }) => {
@@ -933,7 +956,7 @@ class KRIMassRelayServer {
         }
 
         socket.broadcast.emit('group:member_left', data);
-        console.log(`👋 Left group: ${data.userId} from ${data.groupId}`);
+        logEvent('👋 Left group', { userId: data.userId, groupId: data.groupId });
       });
 
       // Channels/groups: best-effort subscribe/unsubscribe + subscriber count query
@@ -995,7 +1018,7 @@ class KRIMassRelayServer {
         const recipient = this.users.get(data.to);
         if (recipient) {
           this.io.to(recipient.socketId).emit('file:receive', data);
-          console.log(`📎 File chunk ${data.chunkIndex}/${data.totalChunks}: ${data.fileName}`);
+          logEvent('📎 File chunk relayed', { fileId: data.fileId, chunkIndex: data.chunkIndex, totalChunks: data.totalChunks });
         }
       });
 
@@ -1009,7 +1032,7 @@ class KRIMassRelayServer {
         const recipient = this.users.get(data.to);
         if (recipient) {
           this.io.to(recipient.socketId).emit('file:transfer_complete', data);
-          console.log(`✅ File transfer complete: ${data.fileId}`);
+          logEvent('✅ File transfer complete', { fileId: data.fileId });
         }
       });
 
@@ -1025,7 +1048,7 @@ class KRIMassRelayServer {
         const recipient = this.users.get(data.to);
         if (recipient) {
           this.io.to(recipient.socketId).emit('voice:receive', data);
-          console.log(`🎤 Voice message: ${data.from} → ${data.to} (${data.duration}s)`);
+          logEvent('🎤 Voice message relayed', { from: data.from, to: data.to, duration: data.duration });
         }
       });
 
@@ -1046,7 +1069,7 @@ class KRIMassRelayServer {
         }
         // Confirm to sender
         socket.emit('message:deleted', { messageId: data.messageId });
-        console.log(`💣 Self-destruct: message ${data.messageId}`);
+        logEvent('💣 Self-destruct', { messageId: data.messageId });
       });
 
       // P2P обмін ключами
@@ -1074,7 +1097,7 @@ class KRIMassRelayServer {
             timestamp: Date.now()
           });
 
-          console.log(`🔑 Key exchanged: ${socket.id} → ${data.to}`);
+          logEvent('🔑 Key exchanged', { socketId: socket.id, to: data.to });
         }
       });
 
@@ -1136,7 +1159,7 @@ class KRIMassRelayServer {
             userId: user.id
           });
 
-          console.log(`❌ User disconnected: ${user.id}`);
+          logEvent('❌ User disconnected', { userId: user.id });
         }
       });
 
@@ -1154,7 +1177,7 @@ class KRIMassRelayServer {
         originalLength: number;
         timestamp: number;
       }) => {
-        console.log(`📡 [Radar] Broadcast from ${data.userId}`);
+        logEvent('📡 [Radar] Broadcast', { userId: data.userId });
         
         // Rate limiting для broadcast (макс 1 на секунду)
         if (!checkEventRateLimit(data.userId, 'nearby:broadcast')) {
@@ -1170,7 +1193,7 @@ class KRIMassRelayServer {
           timestamp: data.timestamp
         });
         
-        console.log(`✅ [Radar] Broadcasted to all users`);
+        logEvent('✅ [Radar] Broadcasted to all users');
       });
 
       /**
@@ -1181,7 +1204,7 @@ class KRIMassRelayServer {
         userId: string;
         timestamp: number;
       }) => {
-        console.log(`📡 [Radar] Query from ${data.userId}`);
+        logEvent('📡 [Radar] Query', { userId: data.userId });
         
         // Формуємо список онлайн користувачів
         const onlineUsers = Array.from(this.users.values())
@@ -1198,7 +1221,7 @@ class KRIMassRelayServer {
           timestamp: Date.now()
         });
         
-        console.log(`✅ [Radar] Sent ${onlineUsers.length} users`);
+        logEvent('✅ [Radar] Sent users', { count: onlineUsers.length });
       });
 
       /**
@@ -1206,7 +1229,7 @@ class KRIMassRelayServer {
        * Відправляємо користувачу коли хтось з'являється/зникає
        */
       socket.on('nearby:subscribe', (data: { userId: string }) => {
-        console.log(`📡 [Radar] ${data.userId} subscribed to radar updates`);
+        logEvent('📡 [Radar] Subscribed', { userId: data.userId });
         
         // При підписці відправляємо поточний список
         const onlineUsers = Array.from(this.users.values())
