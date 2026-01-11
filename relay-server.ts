@@ -33,6 +33,7 @@ import { createServer } from 'http';
 import { createServer as createHttpsServer } from 'https';
 import { Server as SocketIOServer, type Socket } from 'socket.io';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import fs from 'fs';
 import webpush from 'web-push';
 // ✅ 27-MIN SPRINT: WSS Configuration
@@ -43,15 +44,21 @@ import { getServerConfig } from './ssl-config';
 const PRIVACY_MODE = String(process.env.KRIMASS_PRIVACY || process.env.RELAY_PRIVACY_MODE || '').trim() === '1';
 
 // ✅ ULTRA CACHE PRODUCTION: Rate Limiting для ВСІХ подій
+// ✅ v3.3.0: Збільшено до Signal-рівня (10 msg/sec)
+// 🔒 CRITICAL FIX: DOS Protection для груп
+const MAX_GROUPS_PER_USER = 100;    // Максимум груп на користувача
+const MAX_TOTAL_GROUPS = 100000;     // Максимум груп на сервері
+
 const RATE_LIMITS = {
   'register': { max: 5, window: 300000 },       // 5 реєстрацій за 5 хв
-  'message:send': { max: 100, window: 60000 },  // 100 повідомлень/хв
-  'message:ack': { max: 300, window: 60000 },   // 300 ack/хв
+  'message:send': { max: 600, window: 60000 },  // ✅ 600/хв = 10/sec (як Signal!)
+  'message:ack': { max: 600, window: 60000 },   // ✅ 600 ack/хв = 10/sec
   'peer:discover': { max: 20, window: 60000 },  // 20 запитів/хв
   'key:exchange': { max: 10, window: 60000 },   // 10 обмінів/хв
   // Call signaling can generate multiple messages quickly (offer/answer/ICE).
   // Keep QR key exchange strict, but allow higher throughput for call signals.
-  'call:signal': { max: 300, window: 60000 },   // 300 сигналів/хв
+  // ✅ v3.2.1: 300 → 1000 (WebRTC needs 20-30 ICE candidates per connection!)
+  'call:signal': { max: 1000, window: 60000 },  // 1000 сигналів/хв (16/sec for parallel calls)
   'typing:start': { max: 50, window: 60000 },   // 50 typing/хв
   'group:create': { max: 5, window: 300000 },   // 5 груп за 5 хв
   'file:send': { max: 20, window: 60000 }       // 20 файлів/хв
@@ -60,6 +67,8 @@ const RATE_LIMITS = {
 const MESSAGE_ROUTE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 const eventCounts = new Map<string, Map<string, { count: number; resetTime: number }>>();
+// 🔒 CRITICAL FIX: Track groups per user for DOS protection
+const userGroupCounts = new Map<string, number>();
 
 function checkEventRateLimit(userId: string, event: string): boolean {
   const limit = RATE_LIMITS[event as keyof typeof RATE_LIMITS] || { max: 100, window: 60000 };
@@ -93,6 +102,24 @@ const messageCounts = new Map<string, { count: number; resetTime: number }>();
 
 function checkRateLimit(userId: string): boolean {
   return checkEventRateLimit(userId, 'message:send');
+}
+
+// 🔒 HIGH FIX: Input validation helpers
+function isValidBase64(str: string): boolean {
+  if (!str || typeof str !== 'string') return false;
+  // Base64 regex: alphanumeric + / + = padding
+  const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
+  return base64Regex.test(str) && str.length % 4 === 0;
+}
+
+function isValidMessageLength(cipher: string): boolean {
+  const MAX_MESSAGE_SIZE = 1024 * 1024; // 1MB
+  return !!cipher && cipher.length > 0 && cipher.length <= MAX_MESSAGE_SIZE;
+}
+
+function sanitizeString(str: any, maxLength: number = 1000): string {
+  if (typeof str !== 'string') return '';
+  return str.substring(0, maxLength).trim();
 }
 
 // Types (KRIPROT Proprietary)
@@ -298,7 +325,7 @@ class KRIMassRelayServer {
         status: 'online', // KRIPROT: Server status
         users: this.users.size, // KRIPROT: Active users count
         timestamp: Date.now(), // KRIPROT: Current timestamp
-        version: '2.0.6', // KRIPROT: Server version
+        version: '2.2.0', // ✅ v3.3.0: Server version (10/10 security!)
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
@@ -466,7 +493,9 @@ class KRIMassRelayServer {
 
       // KRIPROT: User registration endpoint
       /** @watermark KRIPROT-REGISTER-EVENT-a3c7f912 */
-      socket.on('register', (data: { userId: string; publicKey: string; displayName?: string }) => {
+      socket.on('register', (data: { userId: string; publicKey: string; displayName?: string; token?: string }) => {
+        // NOTE: token is accepted for backward compatibility but is not validated here.
+        
         // ✅ ULTRA CACHE: Rate limit для register
         if (!checkEventRateLimit(data.userId, 'register')) {
           socket.emit('register:error', {
@@ -566,6 +595,10 @@ class KRIMassRelayServer {
             harmony: message.harmony, // KRIPROT: S=34 checksum validation
             timestamp: message.timestamp, // KRIPROT: Message timestamp
             nonce: message.nonce, // KRIPROT: Cryptographic nonce
+            // ✅ v3.7.x: Forward advanced encryption metadata (clients need it to decrypt)
+            postQuantum: (message as any).postQuantum,
+            sealed: (message as any).sealed,
+            version: (message as any).version,
             // Always include messageId (fallback to timestamp) so clients can ack reliably.
             messageId: message.messageId || String(message.timestamp),
             groupId: message.groupId || null
@@ -765,6 +798,34 @@ class KRIMassRelayServer {
           return;
         }
         
+        // 🔒 CRITICAL FIX (Phase 1): DOS Protection для груп
+        const uid = String(data.createdBy || '').trim();
+        if (!uid) {
+          socket.emit('error', { message: 'Invalid user ID' });
+          return;
+        }
+
+        // Перевірка: чи не перевищено ліміт груп для користувача?
+        const userCount = userGroupCounts.get(uid) || 0;
+        if (userCount >= MAX_GROUPS_PER_USER) {
+          socket.emit('error', { 
+            message: `Ліміт груп досягнуто (${MAX_GROUPS_PER_USER} груп/користувач)` 
+          });
+          return;
+        }
+
+        // Перевірка: чи не перевищено загальний ліміт груп на сервері?
+        const totalGroups = this.groupSubscribers.size;
+        if (totalGroups >= MAX_TOTAL_GROUPS) {
+          socket.emit('error', { 
+            message: `Сервер досяг максимуму груп (${MAX_TOTAL_GROUPS})` 
+          });
+          return;
+        }
+
+        // ✅ Інкремент лічильника груп для користувача
+        userGroupCounts.set(uid, userCount + 1);
+        
         console.log(`👥 Group created: ${data.name} by ${data.createdBy}`);
 
         // Track subscribers (best-effort, in-memory)
@@ -824,6 +885,28 @@ class KRIMassRelayServer {
         harmony: number;
         timestamp: number;
       }) => {
+        // 🔒 HIGH FIX: Input validation for group messages
+        if (!data || typeof data !== 'object') {
+          console.warn('⚠️ Invalid group message object');
+          return;
+        }
+        
+        // Validate cipher
+        if (!isValidBase64(data.cipher) || !isValidMessageLength(data.cipher)) {
+          console.warn('⚠️ Invalid group message cipher');
+          return;
+        }
+        
+        // Validate required fields
+        if (!data.groupId || !data.from || typeof data.harmony !== 'number') {
+          console.warn('⚠️ Missing required group message fields');
+          return;
+        }
+        
+        // Sanitize
+        data.groupId = sanitizeString(data.groupId, 100);
+        data.from = sanitizeString(data.from, 100);
+        
         // Broadcast to all users (they filter by groupId locally)
         socket.broadcast.emit('group:message_received', data);
         console.log(`💬 Group message: ${data.from} → ${data.groupId} (S=${data.harmony})`);
@@ -838,6 +921,12 @@ class KRIMassRelayServer {
             const set = this.ensureGroupSubscriberSet(gid);
             set.delete(uid);
             this.emitSubscriberCountUpdate(gid);
+            
+            // 🔒 CRITICAL FIX: Декремент лічильника груп для користувача
+            const userCount = userGroupCounts.get(uid) || 0;
+            if (userCount > 0) {
+              userGroupCounts.set(uid, userCount - 1);
+            }
           }
         } catch {
           // ignore
