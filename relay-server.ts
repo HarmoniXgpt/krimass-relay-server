@@ -72,19 +72,33 @@ function logEvent(message: string, meta?: Record<string, unknown>): void {
 const MAX_GROUPS_PER_USER = 100;    // Максимум груп на користувача
 const MAX_TOTAL_GROUPS = 100000;     // Максимум груп на сервері
 
-const RATE_LIMITS = {
-  'register': { max: 5, window: 300000 },       // 5 реєстрацій за 5 хв
-  'message:send': { max: 600, window: 60000 },  // ✅ 600/хв = 10/sec (як Signal!)
-  'message:ack': { max: 600, window: 60000 },   // ✅ 600 ack/хв = 10/sec
-  'peer:discover': { max: 20, window: 60000 },  // 20 запитів/хв
-  'key:exchange': { max: 10, window: 60000 },   // 10 обмінів/хв
-  // Call signaling can generate multiple messages quickly (offer/answer/ICE).
-  // Keep QR key exchange strict, but allow higher throughput for call signals.
-  // ✅ v3.2.1: 300 → 1000 (WebRTC needs 20-30 ICE candidates per connection!)
-  'call:signal': { max: 1000, window: 60000 },  // 1000 сигналів/хв (16/sec for parallel calls)
-  'typing:start': { max: 50, window: 60000 },   // 50 typing/хв
-  'group:create': { max: 5, window: 300000 },   // 5 груп за 5 хв
-  'file:send': { max: 20, window: 60000 }       // 20 файлів/хв
+// ✅ v2.2.2: Rate Limiting for ALL events (was 9, now 22)
+const RATE_LIMITS: Record<string, { max: number; window: number }> = {
+  'register':           { max: 5,    window: 300000 },
+  'message:send':       { max: 600,  window: 60000 },
+  'message:ack':        { max: 600,  window: 60000 },
+  'message:self_destruct': { max: 30, window: 60000 },
+  'file:send':          { max: 20,   window: 60000 },
+  'voice:send':         { max: 20,   window: 60000 },
+  'group:create':       { max: 5,    window: 300000 },
+  'group:add_member':   { max: 20,   window: 60000 },
+  'group:message':      { max: 100,  window: 60000 },
+  'group:leave':        { max: 10,   window: 60000 },
+  'webrtc:offer':       { max: 10,   window: 60000 },
+  'webrtc:answer':      { max: 10,   window: 60000 },
+  'webrtc:ice':         { max: 200,  window: 60000 },
+  'webrtc:ring':        { max: 10,   window: 60000 },
+  'webrtc:hangup':      { max: 10,   window: 60000 },
+  'call:signal':        { max: 1000, window: 60000 },
+  'typing:start':       { max: 50,   window: 60000 },
+  'typing:stop':        { max: 50,   window: 60000 },
+  'peer:discover':      { max: 20,   window: 60000 },
+  'key:exchange':       { max: 10,   window: 60000 },
+  'publicKey:request':  { max: 30,   window: 60000 },
+  'nearby:query':       { max: 10,   window: 60000 },
+  'nearby:broadcast':   { max: 10,   window: 60000 },
+  'nearby:subscribe':   { max: 10,   window: 60000 },
+  'sync:request':       { max: 5,    window: 60000 },
 };
 
 const MESSAGE_ROUTE_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -120,9 +134,29 @@ function checkEventRateLimit(userId: string, event: string): boolean {
   return true;
 }
 
-// ✅ LEGACY: Старий метод (для зворотної сумісності)
-const messageCounts = new Map<string, { count: number; resetTime: number }>();
+// ✅ v2.2.2: Periodic cleanup of stale rate-limit entries (prevents memory leak)
+function cleanupStaleRateLimits(): void {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [event, userMap] of eventCounts) {
+    for (const [userId, entry] of userMap) {
+      if (now > entry.resetTime) { userMap.delete(userId); cleaned++; }
+    }
+    if (userMap.size === 0) eventCounts.delete(event);
+  }
+  if (cleaned > 0) console.log(`🧹 Rate-limit cleanup: removed ${cleaned} stale entries`);
+}
 
+// ✅ v2.2.2: Get sender by socket ID (not spoofable client data)
+function getSenderBySocket(users: Map<string, any>, socketId: string): any | null {
+  for (const [, user] of users) {
+    if (user.socketId === socketId) return user;
+  }
+  return null;
+}
+
+// ✅ LEGACY
+const messageCounts = new Map<string, { count: number; resetTime: number }>();
 function checkRateLimit(userId: string): boolean {
   return checkEventRateLimit(userId, 'message:send');
 }
@@ -348,7 +382,7 @@ class KRIMassRelayServer {
         status: 'online', // KRIPROT: Server status
         users: this.users.size, // KRIPROT: Active users count
         timestamp: Date.now(), // KRIPROT: Current timestamp
-        version: '2.2.1', // ✅ v3.3.0: Server version (10/10 security!)
+        version: '2.2.2', // v2.2.2: Sealed Sender + full rate-limit hardening
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
@@ -652,11 +686,35 @@ class KRIMassRelayServer {
         }
       });
 
+      // ═══ v2.2.2: SEALED SENDER — route without seeing sender identity ═══
+      socket.on('message:sealed-send', (data: {
+        to: string; sealedEnvelope: string; messageId: string; timestamp: number; deliveryToken: string;
+      }) => {
+        const sender = getSenderBySocket(this.users, socket.id);
+        if (!sender || !checkEventRateLimit(sender.id, 'message:send')) {
+          socket.emit('message:error', { messageId: String(data.messageId || ''), to: data.to, code: 'RATE_LIMIT_EXCEEDED', timestamp: Date.now() });
+          return;
+        }
+        const recipient = this.users.get(data.to);
+        if (recipient) {
+          this.messageRoutes.set(String(data.messageId), { senderId: data.deliveryToken, senderSocketId: socket.id, recipientId: data.to, createdAt: Date.now() });
+          const roomId = String(recipient.id);
+          const room = this.io.sockets.adapter.rooms.get(roomId);
+          const target = room && room.size > 0 ? roomId : recipient.socketId;
+          this.io.to(target).emit('message:receive', { from: '<sealed>', cipher: data.sealedEnvelope, kriKey: '', harmony: 34, timestamp: data.timestamp, nonce: '', messageId: data.messageId });
+          socket.emit('message:delivered', { messageId: data.messageId, to: data.to, timestamp: Date.now() });
+          console.log(`📨🔒 SEALED: <hidden> → ${data.to}`);
+        } else {
+          socket.emit('message:error', { messageId: String(data.messageId || ''), code: 'RECIPIENT_NOT_FOUND', error: 'Recipient not found', to: data.to, timestamp: Date.now() });
+        }
+      });
+
       // Public key on-demand (metadata minimization)
       socket.on('publicKey:request', (data: { to: string; requestId?: string }) => {
         try {
-          const requester = Array.from(this.users.values()).find(u => u.socketId === socket.id);
+          const requester = getSenderBySocket(this.users, socket.id);
           if (!requester || !data?.to) return;
+          if (!checkEventRateLimit(requester.id, 'publicKey:request')) return;
           const target = this.users.get(String(data.to));
           if (!target) return;
 
@@ -1252,6 +1310,10 @@ class KRIMassRelayServer {
    * Запуск сервера
    */
   start() {
+    // v2.2.2: Cleanup stale rate-limit entries every 60s (memory leak fix)
+    const rlCleanup = setInterval(() => cleanupStaleRateLimits(), 60 * 1000);
+    if (typeof rlCleanup.unref === 'function') rlCleanup.unref();
+
     this.server.listen(this.port, () => {
       console.log(`
 ╔═══════════════════════════════════════════╗
