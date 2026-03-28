@@ -156,9 +156,68 @@ function getSenderBySocket(users: Map<string, any>, socketId: string): any | nul
 }
 
 // ✅ LEGACY
-const messageCounts = new Map<string, { count: number; resetTime: number }>();
 function checkRateLimit(userId: string): boolean {
   return checkEventRateLimit(userId, 'message:send');
+}
+
+// ═══ v2.2.3: OFFLINE MESSAGE QUEUE ═══
+// When recipient is offline, messages are queued in memory (max 100 per user, 24h TTL).
+// Delivered automatically when recipient connects.
+interface QueuedMessage {
+  payload: any;
+  timestamp: number;
+}
+const offlineQueue = new Map<string, QueuedMessage[]>();
+const OFFLINE_QUEUE_MAX_PER_USER = 100;
+const OFFLINE_QUEUE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function queueOfflineMessage(recipientId: string, payload: any): void {
+  let queue = offlineQueue.get(recipientId);
+  if (!queue) {
+    queue = [];
+    offlineQueue.set(recipientId, queue);
+  }
+  // Enforce max queue size
+  if (queue.length >= OFFLINE_QUEUE_MAX_PER_USER) {
+    queue.shift(); // Drop oldest
+  }
+  queue.push({ payload, timestamp: Date.now() });
+}
+
+function drainOfflineQueue(recipientId: string, io: any): number {
+  const queue = offlineQueue.get(recipientId);
+  if (!queue || queue.length === 0) return 0;
+
+  const now = Date.now();
+  let delivered = 0;
+  const fresh = queue.filter(m => (now - m.timestamp) < OFFLINE_QUEUE_TTL_MS);
+
+  for (const msg of fresh) {
+    io.to(recipientId).emit('message:receive', msg.payload);
+    delivered++;
+  }
+
+  offlineQueue.delete(recipientId);
+  if (delivered > 0) {
+    console.log(`📬 Delivered ${delivered} queued messages to ${recipientId}`);
+  }
+  return delivered;
+}
+
+function cleanupOfflineQueue(): void {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [userId, queue] of offlineQueue) {
+    const fresh = queue.filter(m => (now - m.timestamp) < OFFLINE_QUEUE_TTL_MS);
+    if (fresh.length === 0) {
+      offlineQueue.delete(userId);
+      cleaned++;
+    } else if (fresh.length < queue.length) {
+      offlineQueue.set(userId, fresh);
+      cleaned += queue.length - fresh.length;
+    }
+  }
+  if (cleaned > 0) console.log(`🧹 Offline queue cleanup: removed ${cleaned} expired entries`);
 }
 
 // 🔒 HIGH FIX: Input validation helpers
@@ -382,7 +441,7 @@ class KRIMassRelayServer {
         status: 'online', // KRIPROT: Server status
         users: this.users.size, // KRIPROT: Active users count
         timestamp: Date.now(), // KRIPROT: Current timestamp
-        version: '2.2.2', // v2.2.2: Sealed Sender + full rate-limit hardening
+        version: '2.2.3', // v2.2.3: + offline message queue
         message: '🌿 KRIMASS Relay Server - Zero Knowledge'
       });
     });
@@ -589,6 +648,9 @@ class KRIMassRelayServer {
           timestamp: Date.now()
         });
 
+        // v2.2.3: Deliver queued offline messages
+        try { drainOfflineQueue(String(data.userId), this.io); } catch {}
+
         // KRIPROT: Broadcast new user online
         this.io.emit('user:online', PRIVACY_MODE ? {
           userId: data.userId
@@ -679,8 +741,20 @@ class KRIMassRelayServer {
               timestamp: Number((message as any).timestamp || Date.now())
             });
           } catch {}
+          // v2.2.3: Queue message for offline recipient (delivered when they connect)
+          queueOfflineMessage(String(message.to), {
+            from: message.from,
+            cipher: message.cipher,
+            kriKey: message.kriKey,
+            harmony: message.harmony,
+            timestamp: message.timestamp,
+            nonce: message.nonce,
+            messageId: message.messageId || String(message.timestamp),
+            groupId: (message as any).groupId || null
+          });
           socket.emit('message:error', {
-            error: 'Recipient not found',
+            error: 'Recipient offline — message queued for delivery',
+            code: 'RECIPIENT_OFFLINE_QUEUED',
             to: message.to
           });
         }
@@ -1310,8 +1384,8 @@ class KRIMassRelayServer {
    * Запуск сервера
    */
   start() {
-    // v2.2.2: Cleanup stale rate-limit entries every 60s (memory leak fix)
-    const rlCleanup = setInterval(() => cleanupStaleRateLimits(), 60 * 1000);
+    // v2.2.3: Cleanup stale rate-limit entries + offline queue every 60s
+    const rlCleanup = setInterval(() => { cleanupStaleRateLimits(); cleanupOfflineQueue(); }, 60 * 1000);
     if (typeof rlCleanup.unref === 'function') rlCleanup.unref();
 
     this.server.listen(this.port, () => {
