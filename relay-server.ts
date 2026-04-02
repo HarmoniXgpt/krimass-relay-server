@@ -220,6 +220,60 @@ function cleanupOfflineQueue(): void {
   if (cleaned > 0) console.log(`🧹 Offline queue cleanup: removed ${cleaned} expired entries`);
 }
 
+// ═══ v2.2.3: OFFLINE KEY EXCHANGE QUEUE ═══
+// key:exchange is used for first contact (QTH/QR). If recipient is offline (or reconnects),
+// the event must not be dropped. We queue it in memory with TTL and deliver on next register.
+interface QueuedKeyExchange {
+  payload: any;
+  timestamp: number;
+}
+const offlineKeyQueue = new Map<string, QueuedKeyExchange[]>();
+const OFFLINE_KEY_QUEUE_MAX_PER_USER = 50;
+const OFFLINE_KEY_QUEUE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function queueOfflineKeyExchange(recipientId: string, payload: any): void {
+  let queue = offlineKeyQueue.get(recipientId);
+  if (!queue) {
+    queue = [];
+    offlineKeyQueue.set(recipientId, queue);
+  }
+  if (queue.length >= OFFLINE_KEY_QUEUE_MAX_PER_USER) queue.shift();
+  queue.push({ payload, timestamp: Date.now() });
+}
+
+function drainOfflineKeyExchangeQueue(recipientId: string, io: any): number {
+  const queue = offlineKeyQueue.get(recipientId);
+  if (!queue || queue.length === 0) return 0;
+
+  const now = Date.now();
+  let delivered = 0;
+  const fresh = queue.filter(m => (now - m.timestamp) < OFFLINE_KEY_QUEUE_TTL_MS);
+  for (const msg of fresh) {
+    io.to(recipientId).emit('key:received', msg.payload);
+    delivered++;
+  }
+
+  offlineKeyQueue.delete(recipientId);
+  if (delivered > 0) console.log(`🔑📬 Delivered ${delivered} queued key exchanges to ${recipientId}`);
+  return delivered;
+}
+
+function cleanupOfflineKeyExchangeQueue(): void {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [userId, queue] of offlineKeyQueue) {
+    const fresh = queue.filter(m => (now - m.timestamp) < OFFLINE_KEY_QUEUE_TTL_MS);
+    if (fresh.length === 0) {
+      offlineKeyQueue.delete(userId);
+      cleaned++;
+    } else if (fresh.length < queue.length) {
+      offlineKeyQueue.set(userId, fresh);
+      cleaned += queue.length - fresh.length;
+    }
+  }
+  if (cleaned > 0) console.log(`🧹 Offline key queue cleanup: removed ${cleaned} expired entries`);
+}
+
 // 🔒 HIGH FIX: Input validation helpers
 function isValidBase64(str: string): boolean {
   if (!str || typeof str !== 'string') return false;
@@ -631,16 +685,9 @@ class KRIMassRelayServer {
 
         // Join a stable room keyed by userId.
         // This makes delivery/ack robust across reconnects (socketId changes) and supports multi-tab/device.
-        try {
-          socket.join(String(data.userId));
-        } catch {
-          // ignore
-        }
+        try { socket.join(String(data.userId)); } catch {}
         
         this.users.set(data.userId, user); // KRIPROT: Store in registry
-
-        // ✅ PRODUCTION RELIABILITY: stable room per userId (survives reconnect/socketId churn)
-        socket.join(String(data.userId));
         
         socket.emit('registered', {
           success: true,
@@ -650,6 +697,8 @@ class KRIMassRelayServer {
 
         // v2.2.3: Deliver queued offline messages
         try { drainOfflineQueue(String(data.userId), this.io); } catch {}
+        // v2.2.3: Deliver queued first-contact key exchanges (QTH/QR)
+        try { drainOfflineKeyExchangeQueue(String(data.userId), this.io); } catch {}
 
         // KRIPROT: Broadcast new user online
         this.io.emit('user:online', PRIVACY_MODE ? {
@@ -879,21 +928,27 @@ class KRIMassRelayServer {
 
       // ✅ ULTRA SPRINT 1: WebRTC Video Calls - SDP/ICE Relay
       /** @watermark KRIPROT-WEBRTC-SIGNALING-c9d2e4f3 */
-      socket.on('webrtc:offer', (data: { to: string; offer: any }) => {
-        const recipient = this.users.get(data.to);
+      socket.on('webrtc:offer', (data: { to: string; offer: any; callId?: string; type?: string }) => {
+        const toId = String(data?.to || '').trim();
+        if (!toId) return;
+        const recipient = this.users.get(toId);
         if (recipient) {
           const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
-          this.io.to(recipient.socketId).emit('webrtc:offer', {
+          const room = this.io.sockets.adapter.rooms.get(toId);
+          const target = room && room.size > 0 ? toId : recipient.socketId;
+          this.io.to(target).emit('webrtc:offer', {
             from: sender?.id,
             offer: data.offer,
-            callerName: sender?.displayName || undefined
+            callId: (data as any)?.callId || undefined,
+            type: (data as any)?.type || undefined,
+            callerName: sender?.displayName || undefined,
           });
-          logEvent('📹 WebRTC offer', { from: sender?.id, to: data.to });
+          logEvent('📹 WebRTC offer', { from: sender?.id, to: toId });
         } else {
           // Best-effort Web Push for incoming call when recipient is offline.
           try {
             const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
-            void this.sendWebPushIfPossible(String(data.to), {
+            void this.sendWebPushIfPossible(String(toId), {
               type: 'call',
               from: String(sender?.id || ''),
               timestamp: Date.now()
@@ -902,37 +957,52 @@ class KRIMassRelayServer {
         }
       });
 
-      socket.on('webrtc:answer', (data: { to: string; answer: any }) => {
-        const recipient = this.users.get(data.to);
+      socket.on('webrtc:answer', (data: { to: string; answer: any; callId?: string }) => {
+        const toId = String(data?.to || '').trim();
+        if (!toId) return;
+        const recipient = this.users.get(toId);
         if (recipient) {
           const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
-          this.io.to(recipient.socketId).emit('webrtc:answer', {
+          const room = this.io.sockets.adapter.rooms.get(toId);
+          const target = room && room.size > 0 ? toId : recipient.socketId;
+          this.io.to(target).emit('webrtc:answer', {
             from: sender?.id,
-            answer: data.answer
+            answer: data.answer,
+            callId: (data as any)?.callId || undefined,
           });
-          logEvent('📹 WebRTC answer', { from: sender?.id, to: data.to });
+          logEvent('📹 WebRTC answer', { from: sender?.id, to: toId });
         }
       });
 
-      socket.on('webrtc:ice', (data: { to: string; candidate: any }) => {
-        const recipient = this.users.get(data.to);
+      socket.on('webrtc:ice', (data: { to: string; candidate: any; callId?: string }) => {
+        const toId = String(data?.to || '').trim();
+        if (!toId) return;
+        const recipient = this.users.get(toId);
         if (recipient) {
           const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
-          this.io.to(recipient.socketId).emit('webrtc:ice', {
+          const room = this.io.sockets.adapter.rooms.get(toId);
+          const target = room && room.size > 0 ? toId : recipient.socketId;
+          this.io.to(target).emit('webrtc:ice', {
             from: sender?.id,
-            candidate: data.candidate
+            candidate: data.candidate,
+            callId: (data as any)?.callId || undefined,
           });
         }
       });
 
-      socket.on('webrtc:hangup', (data: { to: string }) => {
-        const recipient = this.users.get(data.to);
+      socket.on('webrtc:hangup', (data: { to: string; callId?: string }) => {
+        const toId = String(data?.to || '').trim();
+        if (!toId) return;
+        const recipient = this.users.get(toId);
         if (recipient) {
           const sender = Array.from(this.users.values()).find(u => u.socketId === socket.id);
-          this.io.to(recipient.socketId).emit('webrtc:hangup', {
-            from: sender?.id
+          const room = this.io.sockets.adapter.rooms.get(toId);
+          const target = room && room.size > 0 ? toId : recipient.socketId;
+          this.io.to(target).emit('webrtc:hangup', {
+            from: sender?.id,
+            callId: (data as any)?.callId || undefined,
           });
-          logEvent('📵 WebRTC hangup', { from: sender?.id, to: data.to });
+          logEvent('📵 WebRTC hangup', { from: sender?.id, to: toId });
         }
       });
 
@@ -1218,18 +1288,40 @@ class KRIMassRelayServer {
           return;
         }
         
-        const recipient = this.users.get(data.to);
+        const toId = String((data as any)?.to || '').trim();
+        if (!toId) return;
+        const recipient = this.users.get(toId);
         
         if (recipient) {
-          this.io.to(recipient.socketId).emit('key:received', {
+          const payload = {
             // Use stable userId when available (socket.id breaks cross-device identity)
             from: sender?.id || socket.id,
-            publicKey: data.publicKey,
-            qrData: data.qrData,
+            publicKey: (data as any)?.publicKey,
+            qrData: (data as any)?.qrData,
             timestamp: Date.now()
-          });
+          };
+          // Prefer userId-room delivery; fallback to socketId if room empty.
+          const room = this.io.sockets.adapter.rooms.get(toId);
+          const target = room && room.size > 0 ? toId : recipient.socketId;
+          this.io.to(target).emit('key:received', payload);
 
-          logEvent('🔑 Key exchanged', { socketId: socket.id, to: data.to });
+          logEvent('🔑 Key exchanged', { socketId: socket.id, to: toId });
+          return;
+        }
+
+        // Recipient offline:
+        // - NEVER queue call signaling tunneled through qrData (stale)
+        // - Queue first-contact key exchange (QTH/QR) and deliver on next register
+        if (!isCallSignal) {
+          const payload = {
+            from: sender?.id || socket.id,
+            publicKey: (data as any)?.publicKey,
+            qrData: (data as any)?.qrData,
+            timestamp: Date.now()
+          };
+          queueOfflineKeyExchange(toId, payload);
+          try { socket.emit('key:queued', { to: toId, timestamp: Date.now() }); } catch {}
+          logEvent('🔑📬 Key exchange queued (offline)', { to: toId });
         }
       });
 
@@ -1384,8 +1476,8 @@ class KRIMassRelayServer {
    * Запуск сервера
    */
   start() {
-    // v2.2.3: Cleanup stale rate-limit entries + offline queue every 60s
-    const rlCleanup = setInterval(() => { cleanupStaleRateLimits(); cleanupOfflineQueue(); }, 60 * 1000);
+    // v2.2.3: Cleanup stale rate-limit entries + offline queues every 60s
+    const rlCleanup = setInterval(() => { cleanupStaleRateLimits(); cleanupOfflineQueue(); cleanupOfflineKeyExchangeQueue(); }, 60 * 1000);
     if (typeof rlCleanup.unref === 'function') rlCleanup.unref();
 
     this.server.listen(this.port, () => {
